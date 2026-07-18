@@ -52,12 +52,14 @@ var (
 
 	postIsuConditionTargetBaseURL string // JIAへのactivate時に登録する，ISUがconditionを送る先のURL
 
-	trendCacheMu sync.RWMutex
-	trendCache   = map[string]trendCacheEntry{}
-	iconCacheMu  sync.RWMutex
-	iconCache    = map[string]iconCacheEntry{}
-	userCacheMu  sync.RWMutex
-	userCache    = map[string]struct{}{}
+	trendCacheMu           sync.RWMutex
+	trendCache             = map[string]trendCacheEntry{}
+	iconCacheMu            sync.RWMutex
+	iconCache              = map[string]iconCacheEntry{}
+	userCacheMu            sync.RWMutex
+	userCache              = map[string]struct{}{}
+	latestConditionCacheMu sync.RWMutex
+	latestConditionCache   = map[string]IsuCondition{}
 )
 
 type trendCacheEntry struct {
@@ -359,6 +361,10 @@ func postInitialize(c echo.Context) error {
 		c.Logger().Errorf("failed to refresh user cache: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
+	if err = refreshLatestConditionCache(); err != nil {
+		c.Logger().Errorf("failed to refresh latest condition cache: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
 
 	return c.JSON(http.StatusOK, InitializeResponse{
 		Language: "go",
@@ -484,15 +490,8 @@ func getIsuList(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	tx, err := db.Beginx()
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-	defer tx.Rollback()
-
 	isuList := []Isu{}
-	err = tx.Select(
+	err = db.Select(
 		&isuList,
 		"SELECT * FROM `isu` WHERE `jia_user_id` = ? ORDER BY `id` DESC",
 		jiaUserID)
@@ -503,18 +502,9 @@ func getIsuList(c echo.Context) error {
 
 	responseList := []GetIsuListResponse{}
 	for _, isu := range isuList {
-		var lastCondition IsuCondition
-		foundLastCondition := true
-		err = tx.Get(&lastCondition, "SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY `timestamp` DESC LIMIT 1",
-			isu.JIAIsuUUID)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				foundLastCondition = false
-			} else {
-				c.Logger().Errorf("db error: %v", err)
-				return c.NoContent(http.StatusInternalServerError)
-			}
-		}
+		latestConditionCacheMu.RLock()
+		lastCondition, foundLastCondition := latestConditionCache[isu.JIAIsuUUID]
+		latestConditionCacheMu.RUnlock()
 
 		var formattedCondition *GetIsuConditionResponse
 		if foundLastCondition {
@@ -542,12 +532,6 @@ func getIsuList(c echo.Context) error {
 			Character:          isu.Character,
 			LatestIsuCondition: formattedCondition}
 		responseList = append(responseList, res)
-	}
-
-	err = tx.Commit()
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
 	}
 
 	return c.JSON(http.StatusOK, responseList)
@@ -1163,6 +1147,47 @@ func refreshUserCache() error {
 	return nil
 }
 
+func refreshLatestConditionCache() error {
+	conditions := []IsuCondition{}
+	if err := db.Select(&conditions, `
+		SELECT c.*
+		FROM isu AS i
+		JOIN isu_condition AS c ON c.id = (
+			SELECT c2.id
+			FROM isu_condition AS c2
+			WHERE c2.jia_isu_uuid = i.jia_isu_uuid
+			ORDER BY c2.timestamp DESC, c2.id DESC
+			LIMIT 1
+		)`); err != nil {
+		return fmt.Errorf("load latest conditions: %w", err)
+	}
+	next := make(map[string]IsuCondition, len(conditions))
+	for _, condition := range conditions {
+		next[condition.JIAIsuUUID] = condition
+	}
+
+	latestConditionCacheMu.Lock()
+	latestConditionCache = next
+	latestConditionCacheMu.Unlock()
+	return nil
+}
+
+func setLatestConditionCache(jiaIsuUUID string, request PostIsuConditionRequest) {
+	condition := IsuCondition{
+		JIAIsuUUID: jiaIsuUUID,
+		Timestamp:  time.Unix(request.Timestamp, 0),
+		IsSitting:  request.IsSitting,
+		Condition:  request.Condition,
+		Message:    request.Message,
+	}
+	latestConditionCacheMu.Lock()
+	current, ok := latestConditionCache[jiaIsuUUID]
+	if !ok || !condition.Timestamp.Before(current.Timestamp) {
+		latestConditionCache[jiaIsuUUID] = condition
+	}
+	latestConditionCacheMu.Unlock()
+}
+
 func refreshIconCache() error {
 	type iconRow struct {
 		JIAIsuUUID string `db:"jia_isu_uuid"`
@@ -1338,6 +1363,7 @@ func postIsuCondition(c echo.Context) error {
 		}
 	}
 	setTrendCacheCondition(jiaIsuUUID, latest.Timestamp, latest.Condition)
+	setLatestConditionCache(jiaIsuUUID, latest)
 
 	return c.NoContent(http.StatusAccepted)
 }
