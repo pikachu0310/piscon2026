@@ -36,4 +36,37 @@ CPU profileでOSへの書き込みを含む `syscall.Syscall` が22.62%を占め
 
 ### スコア
 
+- run ID: `loop1-no-drop-log`
+- commit: `b46c55e`
+- score: **2,278（PASSED）**
+- 前回比: **+561（+32.7%）**
+- 計測error: 0
+
+ログを外した後も `syscall.Syscall` は21.96%でした。これはHTTPやDB通信にも使われるため、警告ログだけが原因ではありません。一方、同程度のcondition POSTを受けながらスコアは大きく上がり、DB接続待ち合計も12,276秒から9,809秒へ減りました。
+
+### 次に見るもの
+
+遅いGET APIとSQLの検索方法を確認します。
+
+## 2. condition検索用indexを追加する
+
+### 見た計測結果
+
+- `GET /api/isu`: 平均732ms、合計275秒
+- `GET /api/condition/:uuid`: 平均240ms、合計88秒
+- `GET /api/trend`: 平均830ms、合計37秒
+- `GET /api/isu/:uuid/graph`: 平均177ms、合計29秒
+- DB接続待ち: 14,770回、合計9,809秒
+
+これらの実装は、`isu_condition` を `jia_isu_uuid` で絞り、`timestamp` 順に読むqueryを繰り返します。しかしschemaには主キーしかありません。実機の `EXPLAIN` でもcondition検索は `type=ALL`、約70,957行の全走査とfilesortになっていました。`isu` のユーザー別一覧も約72行を全走査していました。
+
+### 修正
+
+- `isu_condition (jia_isu_uuid, timestamp)` の複合indexを追加
+- `isu (jia_user_id)` のindexを追加
+
+queryやレスポンスは変えず、必要な行へ辿る方法だけを変えます。
+
+### スコア
+
 計測後に追記します。
