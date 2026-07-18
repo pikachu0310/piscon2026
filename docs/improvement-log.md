@@ -513,3 +513,35 @@ SQLで無理に1本へまとめるのではなく、書き込み時に最新cond
 ### 修正
 
 `/initialize` で各ISUの最新conditionを1度だけ読み込みます。condition保存成功時にはtimestampを比較してcacheを更新します。ISU一覧は所有ISUを取得するSQL 1本だけにし、最新conditionはメモリからresponseへ合成します。読み取り専用transactionも不要になります。
+
+### スコア
+
+- run ID: `loop16-latest-condition-cache`
+- commit: `2a3eeaa`
+- score: **16,580（PASSED）**
+- 前回比: **+1,196（+7.8%）**
+- 計測error: 4（180秒指定の固定長collectorをベンチ終了後に止めきれず、pprof・sar・DBStatsが欠損）
+
+主な変化:
+
+- `/api/isu`平均: 271ms → 215ms
+- `/api/isu`回数: 2,745回 → 3,245回
+- `/api/isu/:id`平均: 150ms → 122ms
+- COMMIT: 19,580回、合計101秒、平均5.16ms
+
+SQL JOIN案の15,095点を上回り、cacheによるN+1解消は採用できます。今回は計測器のdurationを長くしすぎた失敗も残りました。Portalの待機中までpprofを回すのではなく、次からはベンチがRUNNINGになった時点で120秒計測を開始します。
+
+## 17. 読み取り削減後にCOMMIT同期緩和を再検証する
+
+### 見た計測結果
+
+- COMMIT: 19,580回、合計101秒、平均5.16ms
+- loop 9では `innodb_flush_log_at_trx_commit=2` にしてCOMMITを平均0.40msにできた
+- しかし当時は読み取りもDBへ集中し、scoreが13,601へ回帰した
+- 現在は静的配信・user・icon・最新conditionをcacheし、DBの読み取り負荷を大きく減らした
+
+同じ設定でも、周囲のボトルネックが変われば全体への効果は変わります。一度失敗した案を盲目的に封印せず、前提が変わった地点で再計測します。
+
+### 修正
+
+`innodb_flush_log_at_trx_commit` を再び2へ変更します。COMMIT時はOS cacheへ書き、diskへのflushをおおむね1秒ごとにします。instance障害時に直前約1秒の更新を失う可能性があるtrade-offはloop 9と同じです。
