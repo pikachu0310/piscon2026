@@ -798,10 +798,14 @@ func generateIsuGraphResponse(tx *sqlx.Tx, jiaIsuUUID string, graphDate time.Tim
 	var startTimeInThisHour time.Time
 	var condition IsuCondition
 
-	rows, err := tx.Queryx("SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY `timestamp` ASC", jiaIsuUUID)
+	graphEnd := graphDate.Add(24 * time.Hour)
+	rows, err := tx.Queryx(
+		"SELECT * FROM `isu_condition` WHERE `jia_isu_uuid` = ? AND `timestamp` >= ? AND `timestamp` < ? ORDER BY `timestamp` ASC",
+		jiaIsuUUID, graphDate, graphEnd)
 	if err != nil {
 		return nil, fmt.Errorf("db error: %v", err)
 	}
+	defer rows.Close()
 
 	for rows.Next() {
 		err = rows.StructScan(&condition)
@@ -847,23 +851,6 @@ func generateIsuGraphResponse(tx *sqlx.Tx, jiaIsuUUID string, graphDate time.Tim
 				ConditionTimestamps: timestampsInThisHour})
 	}
 
-	endTime := graphDate.Add(time.Hour * 24)
-	startIndex := len(dataPoints)
-	endNextIndex := len(dataPoints)
-	for i, graph := range dataPoints {
-		if startIndex == len(dataPoints) && !graph.StartAt.Before(graphDate) {
-			startIndex = i
-		}
-		if endNextIndex == len(dataPoints) && graph.StartAt.After(endTime) {
-			endNextIndex = i
-		}
-	}
-
-	filteredDataPoints := []GraphDataPointWithInfo{}
-	if startIndex < endNextIndex {
-		filteredDataPoints = dataPoints[startIndex:endNextIndex]
-	}
-
 	responseList := []GraphResponse{}
 	index := 0
 	thisTime := graphDate
@@ -872,8 +859,8 @@ func generateIsuGraphResponse(tx *sqlx.Tx, jiaIsuUUID string, graphDate time.Tim
 		var data *GraphDataPoint
 		timestamps := []int64{}
 
-		if index < len(filteredDataPoints) {
-			dataWithInfo := filteredDataPoints[index]
+		if index < len(dataPoints) {
+			dataWithInfo := dataPoints[index]
 
 			if dataWithInfo.StartAt.Equal(thisTime) {
 				data = &dataWithInfo.Data
