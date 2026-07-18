@@ -10,3 +10,8 @@ slow_query_log=OFF
 log_output=FILE
 long_query_time=0
 slow_query_log_file=/var/log/mysql/isucon-slow.log
+
+# Score runs commit thousands of tiny condition transactions. Avoid forcing
+# an fsync for every commit; an OS/instance crash may lose roughly one second
+# of the latest transactions.
+innodb_flush_log_at_trx_commit=2
