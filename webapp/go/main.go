@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
@@ -50,7 +51,18 @@ var (
 	jiaJWTSigningKey *ecdsa.PublicKey
 
 	postIsuConditionTargetBaseURL string // JIAへのactivate時に登録する，ISUがconditionを送る先のURL
+
+	trendCacheMu sync.RWMutex
+	trendCache   = map[string]trendCacheEntry{}
 )
+
+type trendCacheEntry struct {
+	ID             int
+	Character      string
+	HasCondition   bool
+	Timestamp      int64
+	ConditionLevel string
+}
 
 type Config struct {
 	Name string `db:"name"`
@@ -312,7 +324,6 @@ func postInitialize(c echo.Context) error {
 	if err != nil {
 		return c.String(http.StatusBadRequest, "bad request body")
 	}
-
 	cmd := exec.Command("../sql/init.sh")
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stderr
@@ -329,6 +340,10 @@ func postInitialize(c echo.Context) error {
 	)
 	if err != nil {
 		c.Logger().Errorf("db error : %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	if err = refreshTrendCache(); err != nil {
+		c.Logger().Errorf("failed to refresh trend cache: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
@@ -652,6 +667,7 @@ func postIsu(c echo.Context) error {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
+	setTrendCacheIsu(isu.JIAIsuUUID, isu.ID, isu.Character)
 
 	return c.JSON(http.StatusCreated, isu)
 }
@@ -1078,68 +1094,45 @@ func calculateConditionLevel(condition string) (string, error) {
 // GET /api/trend
 // ISUの性格毎の最新のコンディション情報
 func getTrend(c echo.Context) error {
-	characterList := []Isu{}
-	err := db.Select(&characterList, "SELECT `character` FROM `isu` GROUP BY `character`")
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+	trendCacheMu.RLock()
+	entries := make([]trendCacheEntry, 0, len(trendCache))
+	for _, entry := range trendCache {
+		entries = append(entries, entry)
 	}
+	trendCacheMu.RUnlock()
 
-	res := make([]TrendResponse, 0, len(characterList))
-	characterIndex := make(map[string]int, len(characterList))
-	for _, character := range characterList {
-		characterIndex[character.Character] = len(res)
-		res = append(res, TrendResponse{
-			Character: character.Character,
-			Info:      []*TrendCondition{},
-			Warning:   []*TrendCondition{},
-			Critical:  []*TrendCondition{},
-		})
-	}
-
-	type latestCondition struct {
-		ID        int       `db:"id"`
-		Character string    `db:"character"`
-		Timestamp time.Time `db:"timestamp"`
-		Condition string    `db:"condition"`
-	}
-	latestConditions := []latestCondition{}
-	err = db.Select(&latestConditions, `
-		SELECT i.id, i.character, c.timestamp, c.condition
-		FROM isu AS i
-		JOIN isu_condition AS c ON c.id = (
-			SELECT c2.id
-			FROM isu_condition AS c2
-			WHERE c2.jia_isu_uuid = i.jia_isu_uuid
-			ORDER BY c2.timestamp DESC, c2.id DESC
-			LIMIT 1
-		)`)
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-
-	for _, condition := range latestConditions {
-		index, ok := characterIndex[condition.Character]
+	characters := map[string]*TrendResponse{}
+	for _, entry := range entries {
+		response, ok := characters[entry.Character]
 		if !ok {
+			response = &TrendResponse{
+				Character: entry.Character,
+				Info:      []*TrendCondition{},
+				Warning:   []*TrendCondition{},
+				Critical:  []*TrendCondition{},
+			}
+			characters[entry.Character] = response
+		}
+		if !entry.HasCondition {
 			continue
 		}
-		conditionLevel, err := calculateConditionLevel(condition.Condition)
-		if err != nil {
-			c.Logger().Error(err)
-			return c.NoContent(http.StatusInternalServerError)
-		}
-		trendCondition := &TrendCondition{ID: condition.ID, Timestamp: condition.Timestamp.Unix()}
-		switch conditionLevel {
+
+		trendCondition := &TrendCondition{ID: entry.ID, Timestamp: entry.Timestamp}
+		switch entry.ConditionLevel {
 		case conditionLevelInfo:
-			res[index].Info = append(res[index].Info, trendCondition)
+			response.Info = append(response.Info, trendCondition)
 		case conditionLevelWarning:
-			res[index].Warning = append(res[index].Warning, trendCondition)
+			response.Warning = append(response.Warning, trendCondition)
 		case conditionLevelCritical:
-			res[index].Critical = append(res[index].Critical, trendCondition)
+			response.Critical = append(response.Critical, trendCondition)
 		}
 	}
 
+	res := make([]TrendResponse, 0, len(characters))
+	for _, response := range characters {
+		res = append(res, *response)
+	}
+	sort.Slice(res, func(i, j int) bool { return res[i].Character < res[j].Character })
 	for i := range res {
 		sort.Slice(res[i].Info, func(a, b int) bool {
 			return res[i].Info[a].Timestamp > res[i].Info[b].Timestamp
@@ -1153,6 +1146,83 @@ func getTrend(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, res)
+}
+
+func refreshTrendCache() error {
+	type isuForTrend struct {
+		ID         int    `db:"id"`
+		JIAIsuUUID string `db:"jia_isu_uuid"`
+		Character  string `db:"character"`
+	}
+	type latestConditionForTrend struct {
+		JIAIsuUUID string    `db:"jia_isu_uuid"`
+		Timestamp  time.Time `db:"timestamp"`
+		Condition  string    `db:"condition"`
+	}
+
+	isuList := []isuForTrend{}
+	if err := db.Select(&isuList, "SELECT id, jia_isu_uuid, character FROM isu"); err != nil {
+		return fmt.Errorf("load isu for trend: %w", err)
+	}
+	latestConditions := []latestConditionForTrend{}
+	if err := db.Select(&latestConditions, `
+		SELECT i.jia_isu_uuid, c.timestamp, c.condition
+		FROM isu AS i
+		JOIN isu_condition AS c ON c.id = (
+			SELECT c2.id
+			FROM isu_condition AS c2
+			WHERE c2.jia_isu_uuid = i.jia_isu_uuid
+			ORDER BY c2.timestamp DESC, c2.id DESC
+			LIMIT 1
+		)`); err != nil {
+		return fmt.Errorf("load latest conditions for trend: %w", err)
+	}
+
+	next := make(map[string]trendCacheEntry, len(isuList))
+	for _, isu := range isuList {
+		next[isu.JIAIsuUUID] = trendCacheEntry{ID: isu.ID, Character: isu.Character}
+	}
+	for _, condition := range latestConditions {
+		entry, ok := next[condition.JIAIsuUUID]
+		if !ok {
+			continue
+		}
+		level, err := calculateConditionLevel(condition.Condition)
+		if err != nil {
+			return err
+		}
+		entry.HasCondition = true
+		entry.Timestamp = condition.Timestamp.Unix()
+		entry.ConditionLevel = level
+		next[condition.JIAIsuUUID] = entry
+	}
+
+	trendCacheMu.Lock()
+	trendCache = next
+	trendCacheMu.Unlock()
+	return nil
+}
+
+func setTrendCacheIsu(jiaIsuUUID string, id int, character string) {
+	trendCacheMu.Lock()
+	trendCache[jiaIsuUUID] = trendCacheEntry{ID: id, Character: character}
+	trendCacheMu.Unlock()
+}
+
+func setTrendCacheCondition(jiaIsuUUID string, timestamp int64, condition string) {
+	level, err := calculateConditionLevel(condition)
+	if err != nil {
+		return
+	}
+	trendCacheMu.Lock()
+	entry, ok := trendCache[jiaIsuUUID]
+	if ok && (!entry.HasCondition || timestamp >= entry.Timestamp) {
+		entry.HasCondition = true
+		entry.Timestamp = timestamp
+		entry.ConditionLevel = level
+		trendCache[jiaIsuUUID] = entry
+	}
+	trendCacheMu.Unlock()
 }
 
 // POST /api/condition/:jia_isu_uuid
@@ -1218,6 +1288,13 @@ func postIsuCondition(c echo.Context) error {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
+	latest := req[0]
+	for _, condition := range req[1:] {
+		if condition.Timestamp >= latest.Timestamp {
+			latest = condition
+		}
+	}
+	setTrendCacheCondition(jiaIsuUUID, latest.Timestamp, latest.Condition)
 
 	return c.NoContent(http.StatusAccepted)
 }
