@@ -450,3 +450,33 @@ APIではない固定ファイルをGoが処理する必要はありません。
 ### 修正
 
 `/initialize` の直後に全ISUの画像と所有者をメモリへ読み込みます。ISU登録時にもcacheへ追加し、icon APIは所有者を確認してメモリから画像を返します。UUIDだけでcacheを引かず所有者も保持することで、別ユーザーの画像を推測したUUIDで取得できない仕様を維持します。
+
+### スコア
+
+- run ID: `loop14-icon-cache`
+- commit: `e034e6b`
+- score: **12,083（Portal表示はERROR）**
+- 前回比: **+1,279（+11.8%）**
+- 計測error: 0
+
+主な変化:
+
+- icon API平均: 130ms → 44ms
+- icon API合計時間: 1,263秒 → 448秒
+- icon API回数: 9,745回 → 10,220回
+- graph API平均: 52ms → 35ms
+- CPU idle: 49.63% → 57.93%
+
+iconの呼び出しが増えても平均時間は約3分の1になり、scoreも上がりました。一方で全体のDB接続待ちはまだ大きく、Portalのtimeout判定は解消していません。
+
+## 15. sessionのユーザー確認をメモリで行う
+
+### 見た計測結果
+
+認証が必要なすべてのAPIは、cookieからユーザーIDを取り出した後に `SELECT COUNT(*) FROM user` を実行しています。ユーザーは初期化時に読み込まれ、その後は認証成功時に追加されるだけです。
+
+iconをcacheしても平均44msかかるのは、画像SELECTを消した後にもこのユーザー確認SQLとDB connection待ちが1回残るためです。trend以外のほぼすべての読み取りAPIで同じ往復が発生しています。
+
+### 修正
+
+`/initialize` の直後にユーザーIDの集合をメモリへ読み込み、認証成功時に追加します。session確認はこの集合をread lockで参照します。DB初期化とcache更新を同じinitialize request内で行うため、古いユーザーが残ることもありません。

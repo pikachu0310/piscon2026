@@ -56,6 +56,8 @@ var (
 	trendCache   = map[string]trendCacheEntry{}
 	iconCacheMu  sync.RWMutex
 	iconCache    = map[string]iconCacheEntry{}
+	userCacheMu  sync.RWMutex
+	userCache    = map[string]struct{}{}
 )
 
 type trendCacheEntry struct {
@@ -297,15 +299,10 @@ func getUserIDFromSession(c echo.Context) (string, int, error) {
 	}
 
 	jiaUserID := _jiaUserID.(string)
-	var count int
-
-	err = db.Get(&count, "SELECT COUNT(*) FROM `user` WHERE `jia_user_id` = ?",
-		jiaUserID)
-	if err != nil {
-		return "", http.StatusInternalServerError, fmt.Errorf("db error: %v", err)
-	}
-
-	if count == 0 {
+	userCacheMu.RLock()
+	_, exists := userCache[jiaUserID]
+	userCacheMu.RUnlock()
+	if !exists {
 		return "", http.StatusUnauthorized, fmt.Errorf("not found: user")
 	}
 
@@ -358,6 +355,10 @@ func postInitialize(c echo.Context) error {
 		c.Logger().Errorf("failed to refresh icon cache: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
+	if err = refreshUserCache(); err != nil {
+		c.Logger().Errorf("failed to refresh user cache: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
 
 	return c.JSON(http.StatusOK, InitializeResponse{
 		Language: "go",
@@ -404,6 +405,9 @@ func postAuthentication(c echo.Context) error {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
+	userCacheMu.Lock()
+	userCache[jiaUserID] = struct{}{}
+	userCacheMu.Unlock()
 
 	session, err := getSession(c.Request())
 	if err != nil {
@@ -1141,6 +1145,22 @@ func getTrend(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, res)
+}
+
+func refreshUserCache() error {
+	userIDs := []string{}
+	if err := db.Select(&userIDs, "SELECT jia_user_id FROM user"); err != nil {
+		return fmt.Errorf("load users: %w", err)
+	}
+	next := make(map[string]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		next[userID] = struct{}{}
+	}
+
+	userCacheMu.Lock()
+	userCache = next
+	userCacheMu.Unlock()
+	return nil
 }
 
 func refreshIconCache() error {
