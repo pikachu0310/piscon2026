@@ -220,7 +220,7 @@ func init() {
 
 func main() {
 	e := echo.New()
-	e.Debug = true
+	e.Debug = false
 	e.Logger.SetLevel(log.DEBUG)
 
 	e.Use(middleware.Recover())
