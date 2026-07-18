@@ -69,4 +69,41 @@ queryやレスポンスは変えず、必要な行へ辿る方法だけを変え
 
 ### スコア
 
+- run ID: `loop2-indexes`
+- commit: `99073b0`
+- score: **20,024（PASSED）**
+- 前回比: **+17,746（約8.8倍）**
+- 初回比: **約11.7倍**
+- 計測error: 0
+
+主な変化:
+
+- `GET /api/isu`: 平均732ms → 51ms
+- `GET /api/condition/:uuid`: 平均240ms → 56ms
+- `GET /api/isu/:uuid/graph`: 平均177ms → 44ms
+- DB接続待ち合計: 9,809秒 → 725秒
+- CPU idle平均: 27.17% → 62.94%
+
+小さなschema変更ですが、遅いqueryだけでなくDB接続を長時間占有する原因も消えたため、待っていた他のrequestまで一緒に速くなりました。
+
+### 次に見るもの
+
+CPU profileでは `syscall.Syscall` が15.73%で、まだ最大です。Goの起動コードを見るとEchoのrequest loggerが全requestを標準出力へ書き、別途Nginxも同じrequestをJSON記録しています。
+
+## 3. 重複するEcho request logを止める
+
+### 見た計測結果
+
+- `syscall.Syscall`: CPU flat 15.73%
+- Nginx access log: 約9万requestをすでに記録
+- Go側でも `middleware.Logger()` が同じ単位で標準出力へ記録
+
+condition POSTだけでも74,655回あり、競技中に同じアクセスログを二重に書く必要はありません。
+
+### 修正
+
+Echoの `middleware.Logger()` を外します。panicから復帰する `middleware.Recover()` と、分析用のNginx JSON access logは残します。
+
+### スコア
+
 計測後に追記します。
