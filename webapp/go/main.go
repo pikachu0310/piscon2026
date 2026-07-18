@@ -1161,7 +1161,7 @@ func refreshTrendCache() error {
 	}
 
 	isuList := []isuForTrend{}
-	if err := db.Select(&isuList, "SELECT id, jia_isu_uuid, character FROM isu"); err != nil {
+	if err := db.Select(&isuList, "SELECT id, jia_isu_uuid, `character` FROM isu"); err != nil {
 		return fmt.Errorf("load isu for trend: %w", err)
 	}
 	latestConditions := []latestConditionForTrend{}
