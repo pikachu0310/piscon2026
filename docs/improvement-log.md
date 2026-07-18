@@ -417,3 +417,36 @@ APIではない固定ファイルをGoが処理する必要はありません。
 ### 修正
 
 `/assets/` はNginxの `root` と `try_files` で直接配信します。SPAの画面URLと `/` も `index.html` を直接返し、`/api/` と `/initialize` だけをGoへproxyします。ブラウザcacheの検証に必要なETagとLast-ModifiedはNginxが扱います。
+
+### スコア
+
+- run ID: `loop13-nginx-static`
+- commit: `99551e2`
+- score: **10,804（Portal表示はERROR）**
+- 前回比: **-4,291（-28.4%）**
+- 計測error: 0
+
+主な変化:
+
+- asset平均: 約26ms → 1ms未満
+- pprofからEchoのstatic handlerと `context.File` が消えた
+- condition POST: 150,484回 → 168,864回
+- DB接続待ち: 合計16,531秒
+- timeout: 1,500件に達し、PortalがERROR判定
+
+静的配信そのものは狙い通り大幅に高速化しました。ただし入口が速くなって利用者が早く増え、APIとDBへより多くの負荷が届きました。最終scoreは悪化しているため、これ単体をscore改善とは数えません。次のDBボトルネックまで一緒に解消できるかを見ます。
+
+## 14. アイコン画像をメモリから返す
+
+### 見た計測結果
+
+- icon API: 9,745回、合計1,263秒、平均130ms
+- iconは登録後に更新するAPIがなく、不変
+- 毎回MariaDBからBLOBをSELECTしている
+- Nginx化後は静的処理のCPUが消えた一方、DB接続待ちが16,531秒へ増加
+
+変わらない画像をrequestごとにDBから読むと、BLOB転送だけでなくDB connectionを長く占有します。これはメモリcacheと相性の良いデータです。
+
+### 修正
+
+`/initialize` の直後に全ISUの画像と所有者をメモリへ読み込みます。ISU登録時にもcacheへ追加し、icon APIは所有者を確認してメモリから画像を返します。UUIDだけでcacheを引かず所有者も保持することで、別ユーザーの画像を推測したUUIDで取得できない仕様を維持します。

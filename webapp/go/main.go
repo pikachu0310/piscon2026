@@ -54,6 +54,8 @@ var (
 
 	trendCacheMu sync.RWMutex
 	trendCache   = map[string]trendCacheEntry{}
+	iconCacheMu  sync.RWMutex
+	iconCache    = map[string]iconCacheEntry{}
 )
 
 type trendCacheEntry struct {
@@ -62,6 +64,11 @@ type trendCacheEntry struct {
 	HasCondition   bool
 	Timestamp      int64
 	ConditionLevel string
+}
+
+type iconCacheEntry struct {
+	JIAUserID string
+	Image     []byte
 }
 
 type Config struct {
@@ -345,6 +352,10 @@ func postInitialize(c echo.Context) error {
 	}
 	if err = refreshTrendCache(); err != nil {
 		c.Logger().Errorf("failed to refresh trend cache: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	if err = refreshIconCache(); err != nil {
+		c.Logger().Errorf("failed to refresh icon cache: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
@@ -669,6 +680,7 @@ func postIsu(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 	setTrendCacheIsu(isu.JIAIsuUUID, isu.ID, isu.Character)
+	setIconCache(isu.JIAIsuUUID, jiaUserID, image)
 
 	return c.JSON(http.StatusCreated, isu)
 }
@@ -718,19 +730,14 @@ func getIsuIcon(c echo.Context) error {
 
 	jiaIsuUUID := c.Param("jia_isu_uuid")
 
-	var image []byte
-	err = db.Get(&image, "SELECT `image` FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
-		jiaUserID, jiaIsuUUID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return c.String(http.StatusNotFound, "not found: isu")
-		}
-
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+	iconCacheMu.RLock()
+	entry, ok := iconCache[jiaIsuUUID]
+	iconCacheMu.RUnlock()
+	if !ok || entry.JIAUserID != jiaUserID {
+		return c.String(http.StatusNotFound, "not found: isu")
 	}
 
-	return c.Blob(http.StatusOK, "", image)
+	return c.Blob(http.StatusOK, "", entry.Image)
 }
 
 // GET /api/isu/:jia_isu_uuid/graph
@@ -1134,6 +1141,34 @@ func getTrend(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, res)
+}
+
+func refreshIconCache() error {
+	type iconRow struct {
+		JIAIsuUUID string `db:"jia_isu_uuid"`
+		JIAUserID  string `db:"jia_user_id"`
+		Image      []byte `db:"image"`
+	}
+
+	rows := []iconRow{}
+	if err := db.Select(&rows, "SELECT jia_isu_uuid, jia_user_id, image FROM isu"); err != nil {
+		return fmt.Errorf("load icons: %w", err)
+	}
+	next := make(map[string]iconCacheEntry, len(rows))
+	for _, row := range rows {
+		next[row.JIAIsuUUID] = iconCacheEntry{JIAUserID: row.JIAUserID, Image: row.Image}
+	}
+
+	iconCacheMu.Lock()
+	iconCache = next
+	iconCacheMu.Unlock()
+	return nil
+}
+
+func setIconCache(jiaIsuUUID, jiaUserID string, image []byte) {
+	iconCacheMu.Lock()
+	iconCache[jiaIsuUUID] = iconCacheEntry{JIAUserID: jiaUserID, Image: image}
+	iconCacheMu.Unlock()
 }
 
 func refreshTrendCache() error {
