@@ -580,3 +580,33 @@ COMMIT単体は再び大幅に短縮しました。しかしscore差は誤差に
 ### 修正
 
 Nginxは再び全requestをGoへproxyします。user・icon・最新conditionのcacheとグラフ範囲queryは残し、「入口だけを速くする変更」だけを外します。MySQLの耐久性も1へ戻した状態で最終確認します。
+
+### スコア
+
+- run ID: `loop18-no-static-fastpath`
+- commit: `7bbb40c`
+- score: **11,099（PASSED）— 回帰**
+- 前回比: **-5,533（-33.3%）**
+- 計測error: 0
+
+主な変化:
+
+- asset平均: 1ms未満 → 29ms
+- CPU idle: 49%前後 → 21.00%
+- disk busy: 59.22%
+- DB接続待ち: 16,738回、合計27,706秒
+- `/api/isu`回数: 2,664回 → 1,911回
+
+負荷増幅を抑えるという仮説に反し、Goが静的ファイル処理でCPUを使い、APIも遅くなりました。cache改善後の構成ではNginx静的配信が必要です。この試行は不採用とし、Nginx静的配信を戻します。
+
+## 最終採用構成
+
+- MySQL耐久性: `innodb_flush_log_at_trx_commit=1`
+- Nginx: 静的frontendを直接配信、APIをGoへproxy
+- Go DB pool: 20接続
+- sessionユーザー、icon、trend、最新conditionをメモリcache
+- graph SQLは要求された24時間だけ取得
+- debug JSON整形とrequest loggerを無効化
+- 複合indexとFD上限65,536を適用
+
+最終採用構成に対応する直近の実測はloop 16の **16,580点（PASSED）** です。loop 17と18は比較のための不採用試行であり、設定はloop 16相当へ戻しています。
