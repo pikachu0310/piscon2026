@@ -106,4 +106,35 @@ Echoの `middleware.Logger()` を外します。panicから復帰する `middlew
 
 ### スコア
 
+- run ID: `loop3-no-echo-log-retry`
+- commit: `e41bd4c`
+- score: **20,486（PASSED）**
+- 前回比: **+462（+2.3%）**
+- 計測error: 1（Portalの待機後に120秒samplerが終了しきらず、DBStats samplerだけを終了。主要なraw計測は取得済み）
+
+Portalが一度 `WAITING` になったため最初のrunは中断し、同じcommitで計測を開始し直しました。CPUの `syscall.Syscall` は15.73%から13.47%へ下がりましたが、scoreへの影響は小さめでした。
+
+### 次に見るもの
+
+`GET /api/trend` が平均946ms、合計212秒でHTTP側の最大の外れ値です。成功は224回中24回だけで、多くがclient timeoutになっています。
+
+## 4. trendのN+1 queryをまとめる
+
+### 見た計測結果
+
+`getTrend` は次の順でqueryを実行していました。
+
+1. 性格の一覧
+2. 性格ごとのISU一覧
+3. ISUごとのcondition全履歴
+4. Go側では各ISUの先頭1件だけを使用
+
+最新1件しか使わないのに全履歴を転送し、ISU数に比例してquery回数も増えるN+1構造です。CPU profileでもMySQL row decodeと `database/sql.convertAssignRows` が上位へ上がっています。
+
+### 修正
+
+性格一覧のqueryと、全ISUの最新conditionだけを取るqueryの合計2回にまとめます。レスポンスの分類とtimestamp降順はGo側で従来通り維持します。
+
+### スコア
+
 計測後に追記します。
