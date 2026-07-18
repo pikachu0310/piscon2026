@@ -154,6 +154,21 @@ observability/bin/run-finish.sh before-index 12345
 
 例えば `mysql-statement-digests.ndjson` の先頭で `total_seconds` が大きく、`rows_examined` が返した行数より桁違いに多ければ、まずそのSQLの検索条件とindexを調べます。`alp.csv` の先頭と `cpu.top.txt` の上位が同じAPIを指せば、次はそのrouteのGoコードへ進みます。このように「一番大きな数字から次のファイルを決める」のが基本です。
 
+### 実機で一周した例
+
+2026-07-18に初期実装を `baseline-observability` というrun IDで測り、Portalの結果は **PASSED / 1,717点**、計測側のerrorは0件でした。rawデータは公開せず、実機の `/home/isucon/measurements/baseline-observability/` にだけ保存しています。
+
+| 最初に見えた数字 | そこから分かること |
+|---|---|
+| `COMMIT` が7,506回、合計37.44秒 | SQL本文だけでなく、細かいtransactionの確定にもDB時間を使っている |
+| DB接続待ち14,490回、待ち時間合計12,276秒 | `MaxOpenConns=10` の手前に多数のrequestが並んでいる |
+| `POST /api/condition/:uuid` が70,647回、合計624秒 | 1回は短くても、回数の多さで最優先のAPIになる |
+| `GET /api/isu` が378回、平均763ms | 回数だけでなく1回の重さも別の問題として見える |
+| CPUのroute labelはcondition POSTが約67% | HTTP集計で見えたrouteをGo側からも追える |
+| CPU idle平均30.57%、I/O wait平均0.35% | 「diskが100%詰まっている」と即断する状態ではない |
+
+DBStatsの待ち時間は、待っていたgoroutine全部の時間を足した値です。複数requestが同時に待てば、60秒のベンチでも合計が何千秒になることがあります。この例では `wait_duration / wait_count` も計算し、1回あたり約0.85秒待っていると読めます。こうして複数の証拠が同じ方向を指すのを確認してから改善へ進みます。
+
 改善したらrun IDを変えて同じ手順を繰り返します。scoreだけで判断せず、前runと同じボトルネックが減ったか、新しい場所へ移ったかを確認します。
 
 ### Agentへ渡す短い依頼例
