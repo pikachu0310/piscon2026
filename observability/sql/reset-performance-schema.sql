@@ -1,0 +1,4 @@
+TRUNCATE TABLE performance_schema.events_statements_summary_by_digest;
+TRUNCATE TABLE performance_schema.table_io_waits_summary_by_table;
+TRUNCATE TABLE performance_schema.table_io_waits_summary_by_index_usage;
+TRUNCATE TABLE performance_schema.table_lock_waits_summary_by_table;

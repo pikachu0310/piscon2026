@@ -1,0 +1,23 @@
+sort: sum
+reverse: true
+query_string: false
+format: csv
+limit: 100
+nosave_pos: true
+percentiles: [90, 95, 99]
+output: count,2xx,3xx,4xx,5xx,method,uri,min,max,sum,avg,p90,p95,p99
+matching_groups:
+  - /api/isu/[^/]+/icon
+  - /api/isu/[^/]+/graph
+  - /api/isu/[^/]+
+  - /api/condition/[^/]+
+  - /isu/[^/]+/condition
+  - /isu/[^/]+/graph
+  - /isu/[^/]+
+json:
+  uri_key: uri
+  method_key: method
+  time_key: time
+  response_time_key: request_time
+  body_bytes_key: body_bytes
+  status_key: status

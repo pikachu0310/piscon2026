@@ -213,6 +213,7 @@ func main() {
 
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
+	e.Use(profilingMiddleware)
 
 	e.POST("/initialize", postInitialize)
 
@@ -246,6 +247,7 @@ func main() {
 	}
 	db.SetMaxOpenConns(10)
 	defer db.Close()
+	startDiagnosticsServer(e.Logger)
 
 	postIsuConditionTargetBaseURL = os.Getenv("POST_ISUCONDITION_TARGET_BASE_URL")
 	if postIsuConditionTargetBaseURL == "" {

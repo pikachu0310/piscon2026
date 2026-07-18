@@ -1,0 +1,12 @@
+[mysqld]
+# MariaDB 10.3 on the PISCON image has Performance Schema disabled by
+# default. Statement digests are the low-overhead, machine-readable primary
+# signal for database bottlenecks.
+performance_schema=ON
+
+# Keep the detailed file log off during normal score runs. A diagnostic run
+# enables it explicitly, then disables it immediately after the benchmark.
+slow_query_log=OFF
+log_output=FILE
+long_query_time=0
+slow_query_log_file=/var/log/mysql/isucon-slow.log
