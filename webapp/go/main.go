@@ -84,6 +84,12 @@ var (
 		conditions map[string]PostIsuConditionRequest
 	}{conditions: make(map[string]PostIsuConditionRequest)}
 
+	conditionHistoryCache = struct {
+		sync.RWMutex
+		histories map[string]*ConditionHistory
+		loaded    bool
+	}{histories: make(map[string]*ConditionHistory)}
+
 	conditionWriteQueue   = make(chan *ConditionWriteRequest, 2048)
 	conditionWriteBarrier sync.RWMutex
 	conditionWritePending sync.WaitGroup
@@ -125,6 +131,11 @@ type IsuCondition struct {
 	Condition  string    `db:"condition"`
 	Message    string    `db:"message"`
 	CreatedAt  time.Time `db:"created_at"`
+}
+
+type ConditionHistory struct {
+	sync.RWMutex
+	conditions []IsuCondition
 }
 
 type MySQLConnectionEnv struct {
@@ -463,6 +474,112 @@ func snapshotLatestConditions() map[string]PostIsuConditionRequest {
 	return conditions
 }
 
+func reloadConditionHistories() error {
+	rows, err := db.Queryx(
+		"SELECT `jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`" +
+			" FROM `isu_condition` ORDER BY `jia_isu_uuid`, `timestamp`, `id`")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	histories := make(map[string]*ConditionHistory)
+	for rows.Next() {
+		var condition IsuCondition
+		if err = rows.StructScan(&condition); err != nil {
+			return err
+		}
+		history := histories[condition.JIAIsuUUID]
+		if history == nil {
+			history = &ConditionHistory{}
+			histories[condition.JIAIsuUUID] = history
+		}
+		history.conditions = append(history.conditions, condition)
+	}
+	if err = rows.Err(); err != nil {
+		return err
+	}
+
+	conditionHistoryCache.Lock()
+	conditionHistoryCache.histories = histories
+	conditionHistoryCache.loaded = true
+	conditionHistoryCache.Unlock()
+	return nil
+}
+
+func getOrCreateConditionHistory(jiaIsuUUID string) *ConditionHistory {
+	conditionHistoryCache.RLock()
+	history := conditionHistoryCache.histories[jiaIsuUUID]
+	conditionHistoryCache.RUnlock()
+	if history != nil {
+		return history
+	}
+
+	conditionHistoryCache.Lock()
+	defer conditionHistoryCache.Unlock()
+	history = conditionHistoryCache.histories[jiaIsuUUID]
+	if history == nil {
+		history = &ConditionHistory{}
+		conditionHistoryCache.histories[jiaIsuUUID] = history
+	}
+	return history
+}
+
+func cacheConditionHistories(batch []*ConditionWriteRequest) {
+	for _, request := range batch {
+		history := getOrCreateConditionHistory(request.JIAIsuUUID)
+		conditions := make([]IsuCondition, len(request.Conditions))
+		for i, condition := range request.Conditions {
+			conditions[i] = IsuCondition{
+				JIAIsuUUID: request.JIAIsuUUID,
+				Timestamp:  time.Unix(condition.Timestamp, 0),
+				IsSitting:  condition.IsSitting,
+				Condition:  condition.Condition,
+				Message:    condition.Message,
+			}
+		}
+		sort.SliceStable(conditions, func(i, j int) bool {
+			return conditions[i].Timestamp.Before(conditions[j].Timestamp)
+		})
+
+		history.Lock()
+		needsSort := len(history.conditions) > 0 && len(conditions) > 0 &&
+			conditions[0].Timestamp.Before(history.conditions[len(history.conditions)-1].Timestamp)
+		history.conditions = append(history.conditions, conditions...)
+		if needsSort {
+			sort.SliceStable(history.conditions, func(i, j int) bool {
+				return history.conditions[i].Timestamp.Before(history.conditions[j].Timestamp)
+			})
+		}
+		history.Unlock()
+	}
+}
+
+func conditionHistoryRange(jiaIsuUUID string, startTime, endTime time.Time) ([]IsuCondition, bool) {
+	conditionHistoryCache.RLock()
+	loaded := conditionHistoryCache.loaded
+	history := conditionHistoryCache.histories[jiaIsuUUID]
+	conditionHistoryCache.RUnlock()
+	if !loaded {
+		return nil, false
+	}
+	if history == nil {
+		return []IsuCondition{}, true
+	}
+
+	history.RLock()
+	defer history.RUnlock()
+	start := sort.Search(len(history.conditions), func(i int) bool {
+		return !history.conditions[i].Timestamp.Before(startTime)
+	})
+	end := sort.Search(len(history.conditions), func(i int) bool {
+		return !history.conditions[i].Timestamp.Before(endTime)
+	})
+	conditions := make([]IsuCondition, end-start)
+	copy(conditions, history.conditions[start:end])
+	return conditions, true
+}
+
 func runConditionWriter() {
 	for first := range conditionWriteQueue {
 		batch := []*ConditionWriteRequest{first}
@@ -526,6 +643,7 @@ func writeConditionBatch(batch []*ConditionWriteRequest, rowCount int) error {
 		return err
 	}
 	cacheLatestConditions(batch)
+	cacheConditionHistories(batch)
 	return nil
 }
 
@@ -623,6 +741,10 @@ func postInitialize(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 	if err = reloadLatestConditions(); err != nil {
+		c.Logger().Errorf("db error: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	if err = reloadConditionHistories(); err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
@@ -1070,23 +1192,28 @@ func generateIsuGraphResponse(db *sqlx.DB, jiaIsuUUID string, graphDate time.Tim
 	conditionsInThisHour := []IsuCondition{}
 	timestampsInThisHour := []int64{}
 	var startTimeInThisHour time.Time
-	var condition IsuCondition
 
-	rows, err := db.Queryx(
-		"SELECT `jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message` FROM `isu_condition`"+
-			" WHERE `jia_isu_uuid` = ? AND `timestamp` >= ? AND `timestamp` < ? ORDER BY `timestamp` ASC",
-		jiaIsuUUID, graphDate, graphDate.Add(24*time.Hour))
-	if err != nil {
-		return nil, fmt.Errorf("db error: %v", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		err = rows.StructScan(&condition)
+	conditions, loaded := conditionHistoryRange(jiaIsuUUID, graphDate, graphDate.Add(24*time.Hour))
+	if !loaded {
+		conditions = []IsuCondition{}
+		rows, err := db.Queryx(
+			"SELECT `jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message` FROM `isu_condition`"+
+				" WHERE `jia_isu_uuid` = ? AND `timestamp` >= ? AND `timestamp` < ? ORDER BY `timestamp` ASC",
+			jiaIsuUUID, graphDate, graphDate.Add(24*time.Hour))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("db error: %v", err)
 		}
+		defer rows.Close()
+		for rows.Next() {
+			var condition IsuCondition
+			if err = rows.StructScan(&condition); err != nil {
+				return nil, err
+			}
+			conditions = append(conditions, condition)
+		}
+	}
 
+	for _, condition := range conditions {
 		truncatedConditionTime := condition.Timestamp.Truncate(time.Hour)
 		if truncatedConditionTime != startTimeInThisHour {
 			if len(conditionsInThisHour) > 0 {
@@ -1288,12 +1415,68 @@ func getIsuConditions(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	conditionsResponse, err := getIsuConditionsFromDB(db, jiaIsuUUID, endTime, conditionLevel, startTime, conditionLimit, isuName)
+	conditionsResponse, loaded, err := getIsuConditionsFromCache(jiaIsuUUID, endTime, conditionLevel, startTime, conditionLimit, isuName)
+	if err == nil && !loaded {
+		conditionsResponse, err = getIsuConditionsFromDB(db, jiaIsuUUID, endTime, conditionLevel, startTime, conditionLimit, isuName)
+	}
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
 	return c.JSON(http.StatusOK, conditionsResponse)
+}
+
+func getIsuConditionsFromCache(jiaIsuUUID string, endTime time.Time, conditionLevel map[string]interface{}, startTime time.Time,
+	limit int, isuName string) ([]*GetIsuConditionResponse, bool, error) {
+	conditionHistoryCache.RLock()
+	loaded := conditionHistoryCache.loaded
+	history := conditionHistoryCache.histories[jiaIsuUUID]
+	conditionHistoryCache.RUnlock()
+	if !loaded {
+		return nil, false, nil
+	}
+	if history == nil {
+		return []*GetIsuConditionResponse{}, true, nil
+	}
+
+	allowedList := conditionStringsForLevels(conditionLevel)
+	allowed := make(map[string]struct{}, len(allowedList))
+	for _, condition := range allowedList {
+		allowed[condition] = struct{}{}
+	}
+	if len(allowed) == 0 {
+		return []*GetIsuConditionResponse{}, true, nil
+	}
+
+	response := make([]*GetIsuConditionResponse, 0, limit)
+	history.RLock()
+	defer history.RUnlock()
+	for i := len(history.conditions) - 1; i >= 0 && len(response) < limit; i-- {
+		condition := history.conditions[i]
+		if !condition.Timestamp.Before(endTime) {
+			continue
+		}
+		if !startTime.IsZero() && condition.Timestamp.Before(startTime) {
+			break
+		}
+		if _, ok := allowed[condition.Condition]; !ok {
+			continue
+		}
+		level, err := calculateConditionLevel(condition.Condition)
+		if err != nil {
+			continue
+		}
+		response = append(response, &GetIsuConditionResponse{
+			JIAIsuUUID:     condition.JIAIsuUUID,
+			IsuName:        isuName,
+			Timestamp:      condition.Timestamp.Unix(),
+			IsSitting:      condition.IsSitting,
+			Condition:      condition.Condition,
+			ConditionLevel: level,
+			Message:        condition.Message,
+		})
+	}
+	return response, true, nil
 }
 
 // ISUのコンディションをDBから取得
