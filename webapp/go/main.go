@@ -42,6 +42,9 @@ const (
 	scoreConditionLevelWarning  = 2
 	scoreConditionLevelCritical = 1
 	trendCacheTTL               = 100 * time.Millisecond
+	conditionBatchWait          = 2 * time.Millisecond
+	conditionBatchMaxRequests   = 256
+	conditionBatchMaxRows       = 2000
 )
 
 var (
@@ -74,6 +77,9 @@ var (
 		uuids  map[string]struct{}
 		loaded bool
 	}{uuids: make(map[string]struct{})}
+
+	conditionWriteQueue   = make(chan *ConditionWriteRequest, 8192)
+	conditionWriteBarrier sync.RWMutex
 )
 
 type Config struct {
@@ -207,6 +213,13 @@ type PostIsuConditionRequest struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
+type ConditionWriteRequest struct {
+	JIAIsuUUID string
+	Conditions []PostIsuConditionRequest
+	Latest     PostIsuConditionRequest
+	Done       chan error
+}
+
 type JIAServiceRequest struct {
 	TargetBaseURL string `json:"target_base_url"`
 	IsuUUID       string `json:"isu_uuid"`
@@ -289,6 +302,7 @@ func main() {
 	db.SetMaxOpenConns(64)
 	db.SetMaxIdleConns(64)
 	defer db.Close()
+	go runConditionWriter()
 	startDiagnosticsServer(e.Logger)
 
 	postIsuConditionTargetBaseURL = os.Getenv("POST_ISUCONDITION_TARGET_BASE_URL")
@@ -390,6 +404,85 @@ func isKnownIsu(jiaIsuUUID string) (bool, error) {
 	return count != 0, nil
 }
 
+func runConditionWriter() {
+	for first := range conditionWriteQueue {
+		batch := []*ConditionWriteRequest{first}
+		rowCount := len(first.Conditions)
+		timer := time.NewTimer(conditionBatchWait)
+
+	collect:
+		for len(batch) < conditionBatchMaxRequests && rowCount < conditionBatchMaxRows {
+			select {
+			case request := <-conditionWriteQueue:
+				batch = append(batch, request)
+				rowCount += len(request.Conditions)
+			case <-timer.C:
+				break collect
+			}
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+
+		err := writeConditionBatch(batch, rowCount)
+		for _, request := range batch {
+			request.Done <- err
+		}
+	}
+}
+
+func writeConditionBatch(batch []*ConditionWriteRequest, rowCount int) error {
+	tx, err := db.Beginx()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	conditionPlaceholders := make([]string, 0, rowCount)
+	conditionArgs := make([]interface{}, 0, rowCount*5)
+	latestPlaceholders := make([]string, 0, len(batch))
+	latestArgs := make([]interface{}, 0, len(batch)*5)
+
+	for _, request := range batch {
+		for _, condition := range request.Conditions {
+			conditionPlaceholders = append(conditionPlaceholders, "(?, ?, ?, ?, ?)")
+			conditionArgs = append(conditionArgs, request.JIAIsuUUID, time.Unix(condition.Timestamp, 0),
+				condition.IsSitting, condition.Condition, condition.Message)
+		}
+
+		latestPlaceholders = append(latestPlaceholders, "(?, ?, ?, ?, ?)")
+		latestArgs = append(latestArgs, request.JIAIsuUUID, time.Unix(request.Latest.Timestamp, 0),
+			request.Latest.IsSitting, request.Latest.Condition, request.Latest.Message)
+	}
+
+	_, err = tx.Exec(
+		"INSERT INTO `isu_condition`"+
+			" (`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`) VALUES "+
+			strings.Join(conditionPlaceholders, ","),
+		conditionArgs...)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec(
+		"INSERT INTO `isu_condition_latest` (`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`) VALUES "+
+			strings.Join(latestPlaceholders, ",")+
+			" ON DUPLICATE KEY UPDATE"+
+			" `is_sitting` = IF(VALUES(`timestamp`) >= `timestamp`, VALUES(`is_sitting`), `is_sitting`),"+
+			" `condition` = IF(VALUES(`timestamp`) >= `timestamp`, VALUES(`condition`), `condition`),"+
+			" `message` = IF(VALUES(`timestamp`) >= `timestamp`, VALUES(`message`), `message`),"+
+			" `timestamp` = GREATEST(`timestamp`, VALUES(`timestamp`))",
+		latestArgs...)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
 func getUserIDFromSession(c echo.Context) (string, int, error) {
 	cookie, cookieErr := c.Request().Cookie(sessionName)
 	if cookieErr == nil {
@@ -455,6 +548,11 @@ func postInitialize(c echo.Context) error {
 	if err != nil {
 		return c.String(http.StatusBadRequest, "bad request body")
 	}
+
+	// Wait for every accepted condition batch to commit before replacing the DB.
+	// New condition requests resume only after the fresh cache is ready.
+	conditionWriteBarrier.Lock()
+	defer conditionWriteBarrier.Unlock()
 
 	cmd := exec.Command("../sql/init.sh")
 	cmd.Stderr = os.Stderr
@@ -1365,12 +1463,8 @@ func postIsuCondition(c echo.Context) error {
 		return c.String(http.StatusBadRequest, "bad request body")
 	}
 
-	tx, err := db.Beginx()
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-	defer tx.Rollback()
+	conditionWriteBarrier.RLock()
+	defer conditionWriteBarrier.RUnlock()
 
 	known, err := isKnownIsu(jiaIsuUUID)
 	if err != nil {
@@ -1381,47 +1475,24 @@ func postIsuCondition(c echo.Context) error {
 		return c.String(http.StatusNotFound, "not found: isu")
 	}
 
-	placeholders := make([]string, 0, len(req))
-	args := make([]interface{}, 0, len(req)*5)
 	latestCondition := req[0]
 	for _, cond := range req {
-		timestamp := time.Unix(cond.Timestamp, 0)
-
 		if !isValidConditionFormat(cond.Condition) {
 			return c.String(http.StatusBadRequest, "bad request body")
 		}
-		placeholders = append(placeholders, "(?, ?, ?, ?, ?)")
-		args = append(args, jiaIsuUUID, timestamp, cond.IsSitting, cond.Condition, cond.Message)
 		if cond.Timestamp >= latestCondition.Timestamp {
 			latestCondition = cond
 		}
 	}
 
-	_, err = tx.Exec(
-		"INSERT INTO `isu_condition`"+
-			" (`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`) VALUES "+
-			strings.Join(placeholders, ","),
-		args...)
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+	writeRequest := &ConditionWriteRequest{
+		JIAIsuUUID: jiaIsuUUID,
+		Conditions: req,
+		Latest:     latestCondition,
+		Done:       make(chan error, 1),
 	}
-
-	_, err = tx.Exec(
-		"INSERT INTO `isu_condition_latest` (`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`)"+
-			" VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE"+
-			" `is_sitting` = IF(VALUES(`timestamp`) >= `timestamp`, VALUES(`is_sitting`), `is_sitting`),"+
-			" `condition` = IF(VALUES(`timestamp`) >= `timestamp`, VALUES(`condition`), `condition`),"+
-			" `message` = IF(VALUES(`timestamp`) >= `timestamp`, VALUES(`message`), `message`),"+
-			" `timestamp` = GREATEST(`timestamp`, VALUES(`timestamp`))",
-		jiaIsuUUID, time.Unix(latestCondition.Timestamp, 0), latestCondition.IsSitting,
-		latestCondition.Condition, latestCondition.Message)
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-
-	err = tx.Commit()
+	conditionWriteQueue <- writeRequest
+	err = <-writeRequest.Done
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
