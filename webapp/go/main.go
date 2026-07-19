@@ -469,6 +469,7 @@ func reloadConditionHistories() error {
 	if err = rows.Err(); err != nil {
 		return err
 	}
+
 	conditionHistoryCache.Lock()
 	conditionHistoryCache.histories = histories
 	conditionHistoryCache.loaded = true
