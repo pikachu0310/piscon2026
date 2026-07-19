@@ -28,21 +28,20 @@ import (
 )
 
 const (
-	sessionName                  = "isucondition_go"
-	conditionLimit               = 20
-	frontendContentsPath         = "../public"
-	jiaJWTSigningKeyPath         = "../ec256-public.pem"
-	defaultIconFilePath          = "../NoImage.jpg"
-	defaultJIAServiceURL         = "http://localhost:5000"
-	mysqlErrNumDuplicateEntry    = 1062
-	conditionLevelInfo           = "info"
-	conditionLevelWarning        = "warning"
-	conditionLevelCritical       = "critical"
-	scoreConditionLevelInfo      = 3
-	scoreConditionLevelWarning   = 2
-	scoreConditionLevelCritical  = 1
-	trendCacheTTL                = 100 * time.Millisecond
-	conditionBodyPoolMaxCapacity = 256 * 1024
+	sessionName                 = "isucondition_go"
+	conditionLimit              = 20
+	frontendContentsPath        = "../public"
+	jiaJWTSigningKeyPath        = "../ec256-public.pem"
+	defaultIconFilePath         = "../NoImage.jpg"
+	defaultJIAServiceURL        = "http://localhost:5000"
+	mysqlErrNumDuplicateEntry   = 1062
+	conditionLevelInfo          = "info"
+	conditionLevelWarning       = "warning"
+	conditionLevelCritical      = "critical"
+	scoreConditionLevelInfo     = 3
+	scoreConditionLevelWarning  = 2
+	scoreConditionLevelCritical = 1
+	trendCacheTTL               = 100 * time.Millisecond
 )
 
 var (
@@ -50,9 +49,6 @@ var (
 	sessionStore        sessions.Store
 	mySQLConnectionData *MySQLConnectionEnv
 	conditionJSON       = jsoniter.ConfigCompatibleWithStandardLibrary
-	conditionBodyPool   = sync.Pool{New: func() interface{} {
-		return bytes.NewBuffer(make([]byte, 0, 4096))
-	}}
 
 	jiaJWTSigningKey *ecdsa.PublicKey
 
@@ -1579,19 +1575,10 @@ func postIsuCondition(c echo.Context) error {
 		return c.String(http.StatusBadRequest, "missing: jia_isu_uuid")
 	}
 
-	bodyBuffer := conditionBodyPool.Get().(*bytes.Buffer)
-	bodyBuffer.Reset()
-	defer func() {
-		if bodyBuffer.Cap() <= conditionBodyPoolMaxCapacity {
-			bodyBuffer.Reset()
-			conditionBodyPool.Put(bodyBuffer)
-		}
-	}()
-	_, err := bodyBuffer.ReadFrom(c.Request().Body)
+	body, err := ioutil.ReadAll(c.Request().Body)
 	if err != nil {
 		return c.String(http.StatusBadRequest, "bad request body")
 	}
-	body := bodyBuffer.Bytes()
 	req := make([]CachedCondition, 0, bytes.Count(body, []byte("{")))
 	err = conditionJSON.Unmarshal(body, &req)
 	if err != nil {
