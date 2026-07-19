@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"net/http"
 	"reflect"
 	"testing"
 )
@@ -28,26 +27,6 @@ func TestConditionJSONMatchesStandardLibrary(t *testing.T) {
 		}
 		if standardErr == nil && !reflect.DeepEqual(standard, fast) {
 			t.Fatalf("decoded value differs for %q: standard=%#v fast=%#v", body, standard, fast)
-		}
-	}
-}
-
-func TestAcceptsGzip(t *testing.T) {
-	tests := []struct {
-		header string
-		want   bool
-	}{
-		{header: "gzip", want: true},
-		{header: "br, gzip", want: true},
-		{header: "gzip; q=0", want: false},
-		{header: "identity", want: false},
-		{header: "", want: false},
-	}
-
-	for _, tt := range tests {
-		r := &http.Request{Header: http.Header{"Accept-Encoding": []string{tt.header}}}
-		if got := acceptsGzip(r); got != tt.want {
-			t.Fatalf("acceptsGzip(%q) = %v, want %v", tt.header, got, tt.want)
 		}
 	}
 }

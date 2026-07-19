@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"crypto/ecdsa"
 	"database/sql"
 	"encoding/json"
@@ -58,7 +57,6 @@ var (
 	trendCache = struct {
 		sync.Mutex
 		body      []byte
-		gzipBody  []byte
 		expiresAt time.Time
 	}{}
 
@@ -339,7 +337,6 @@ func getSession(r *http.Request) (*sessions.Session, error) {
 func invalidateTrendCache() {
 	trendCache.Lock()
 	trendCache.body = nil
-	trendCache.gzipBody = nil
 	trendCache.expiresAt = time.Time{}
 	trendCache.Unlock()
 }
@@ -1542,39 +1539,13 @@ func buildTrendResponse() ([]TrendResponse, error) {
 	return res, nil
 }
 
-func acceptsGzip(r *http.Request) bool {
-	for _, coding := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
-		parts := strings.Split(coding, ";")
-		if strings.TrimSpace(parts[0]) != "gzip" {
-			continue
-		}
-		for _, parameter := range parts[1:] {
-			if strings.TrimSpace(parameter) == "q=0" {
-				return false
-			}
-		}
-		return true
-	}
-	return false
-}
-
-func writeTrendResponse(c echo.Context, body, gzipBody []byte) error {
-	c.Response().Header().Add("Vary", "Accept-Encoding")
-	if len(gzipBody) != 0 && acceptsGzip(c.Request()) {
-		c.Response().Header().Set("Content-Encoding", "gzip")
-		return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, gzipBody)
-	}
-	return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, body)
-}
-
 func getTrend(c echo.Context) error {
 	now := time.Now()
 	trendCache.Lock()
 	if len(trendCache.body) != 0 && now.Before(trendCache.expiresAt) {
 		body := trendCache.body
-		gzipBody := trendCache.gzipBody
 		trendCache.Unlock()
-		return writeTrendResponse(c, body, gzipBody)
+		return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, body)
 	}
 
 	res, err := buildTrendResponse()
@@ -1589,27 +1560,11 @@ func getTrend(c echo.Context) error {
 		c.Logger().Errorf("json error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
-	var compressed bytes.Buffer
-	gzipWriter, err := gzip.NewWriterLevel(&compressed, gzip.BestSpeed)
-	if err != nil {
-		trendCache.Unlock()
-		c.Logger().Errorf("gzip error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-	if _, err = gzipWriter.Write(body); err == nil {
-		err = gzipWriter.Close()
-	}
-	if err != nil {
-		trendCache.Unlock()
-		c.Logger().Errorf("gzip error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
 	trendCache.body = body
-	trendCache.gzipBody = compressed.Bytes()
 	trendCache.expiresAt = time.Now().Add(trendCacheTTL)
 	trendCache.Unlock()
 
-	return writeTrendResponse(c, body, compressed.Bytes())
+	return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, body)
 }
 
 // POST /api/condition/:jia_isu_uuid
