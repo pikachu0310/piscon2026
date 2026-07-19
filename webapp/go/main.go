@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
@@ -40,6 +41,7 @@ const (
 	scoreConditionLevelInfo     = 3
 	scoreConditionLevelWarning  = 2
 	scoreConditionLevelCritical = 1
+	trendCacheTTL               = 100 * time.Millisecond
 )
 
 var (
@@ -50,6 +52,12 @@ var (
 	jiaJWTSigningKey *ecdsa.PublicKey
 
 	postIsuConditionTargetBaseURL string // JIAへのactivate時に登録する，ISUがconditionを送る先のURL
+
+	trendCache = struct {
+		sync.Mutex
+		body      []byte
+		expiresAt time.Time
+	}{}
 )
 
 type Config struct {
@@ -285,6 +293,13 @@ func getSession(r *http.Request) (*sessions.Session, error) {
 	return session, nil
 }
 
+func invalidateTrendCache() {
+	trendCache.Lock()
+	trendCache.body = nil
+	trendCache.expiresAt = time.Time{}
+	trendCache.Unlock()
+}
+
 func getUserIDFromSession(c echo.Context) (string, int, error) {
 	session, err := getSession(c.Request())
 	if err != nil {
@@ -364,6 +379,7 @@ func postInitialize(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
+	invalidateTrendCache()
 	notifyInitializeCapture()
 	return c.JSON(http.StatusOK, InitializeResponse{
 		Language: "go",
@@ -664,6 +680,7 @@ func postIsu(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
+	invalidateTrendCache()
 	return c.JSON(http.StatusCreated, isu)
 }
 
@@ -1093,12 +1110,11 @@ func calculateConditionLevel(condition string) (string, error) {
 
 // GET /api/trend
 // ISUの性格毎の最新のコンディション情報
-func getTrend(c echo.Context) error {
+func buildTrendResponse() ([]TrendResponse, error) {
 	characterList := []Isu{}
 	err := db.Select(&characterList, "SELECT `character` FROM `isu` GROUP BY `character`")
 	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+		return nil, fmt.Errorf("select characters: %w", err)
 	}
 
 	latestConditions := []TrendQueryRow{}
@@ -1106,8 +1122,7 @@ func getTrend(c echo.Context) error {
 		"SELECT i.`id`, i.`character`, l.`timestamp`, l.`condition` FROM `isu` i"+
 			" LEFT JOIN `isu_condition_latest` l USING (`jia_isu_uuid`)")
 	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+		return nil, fmt.Errorf("select latest conditions: %w", err)
 	}
 
 	type groupedConditions struct {
@@ -1132,8 +1147,7 @@ func getTrend(c echo.Context) error {
 		}
 		conditionLevel, err := calculateConditionLevel(row.Condition.String)
 		if err != nil {
-			c.Logger().Error(err)
-			return c.NoContent(http.StatusInternalServerError)
+			return nil, err
 		}
 		trendCondition := &TrendCondition{ID: row.ID, Timestamp: row.Timestamp.Time.Unix()}
 		switch conditionLevel {
@@ -1171,7 +1185,35 @@ func getTrend(c echo.Context) error {
 			})
 	}
 
-	return c.JSON(http.StatusOK, res)
+	return res, nil
+}
+
+func getTrend(c echo.Context) error {
+	now := time.Now()
+	trendCache.Lock()
+	if len(trendCache.body) != 0 && now.Before(trendCache.expiresAt) {
+		body := trendCache.body
+		trendCache.Unlock()
+		return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, body)
+	}
+
+	res, err := buildTrendResponse()
+	if err != nil {
+		trendCache.Unlock()
+		c.Logger().Errorf("db error: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	body, err := json.Marshal(res)
+	if err != nil {
+		trendCache.Unlock()
+		c.Logger().Errorf("json error: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	trendCache.body = body
+	trendCache.expiresAt = time.Now().Add(trendCacheTTL)
+	trendCache.Unlock()
+
+	return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, body)
 }
 
 // POST /api/condition/:jia_isu_uuid
