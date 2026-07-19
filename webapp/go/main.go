@@ -158,6 +158,13 @@ type TrendCondition struct {
 	Timestamp int64 `json:"timestamp"`
 }
 
+type TrendQueryRow struct {
+	ID        int       `db:"id"`
+	Character string    `db:"character"`
+	Timestamp time.Time `db:"timestamp"`
+	Condition string    `db:"condition"`
+}
+
 type PostIsuConditionRequest struct {
 	IsSitting bool   `json:"is_sitting"`
 	Condition string `json:"condition"`
@@ -1078,69 +1085,72 @@ func getTrend(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	res := []TrendResponse{}
-	for _, character := range characterList {
-		isuList := []Isu{}
-		err = db.Select(&isuList,
-			"SELECT `id`, `jia_isu_uuid`, `character` FROM `isu` WHERE `character` = ?",
-			character.Character,
-		)
+	latestConditions := []TrendQueryRow{}
+	err = db.Select(&latestConditions,
+		"SELECT i.`id`, i.`character`, c.`timestamp`, c.`condition` FROM `isu` i"+
+			" JOIN `isu_condition` c ON c.`id` = ("+
+			" SELECT c2.`id` FROM `isu_condition` c2 WHERE c2.`jia_isu_uuid` = i.`jia_isu_uuid`"+
+			" ORDER BY c2.`timestamp` DESC LIMIT 1)")
+	if err != nil {
+		c.Logger().Errorf("db error: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+
+	type groupedConditions struct {
+		info     []*TrendCondition
+		warning  []*TrendCondition
+		critical []*TrendCondition
+	}
+	newGroupedConditions := func() *groupedConditions {
+		return &groupedConditions{
+			info:     []*TrendCondition{},
+			warning:  []*TrendCondition{},
+			critical: []*TrendCondition{},
+		}
+	}
+	grouped := map[string]*groupedConditions{}
+	for _, row := range latestConditions {
+		if _, ok := grouped[row.Character]; !ok {
+			grouped[row.Character] = newGroupedConditions()
+		}
+		conditionLevel, err := calculateConditionLevel(row.Condition)
 		if err != nil {
-			c.Logger().Errorf("db error: %v", err)
+			c.Logger().Error(err)
 			return c.NoContent(http.StatusInternalServerError)
 		}
+		trendCondition := &TrendCondition{ID: row.ID, Timestamp: row.Timestamp.Unix()}
+		switch conditionLevel {
+		case conditionLevelInfo:
+			grouped[row.Character].info = append(grouped[row.Character].info, trendCondition)
+		case conditionLevelWarning:
+			grouped[row.Character].warning = append(grouped[row.Character].warning, trendCondition)
+		case conditionLevelCritical:
+			grouped[row.Character].critical = append(grouped[row.Character].critical, trendCondition)
+		}
+	}
 
-		characterInfoIsuConditions := []*TrendCondition{}
-		characterWarningIsuConditions := []*TrendCondition{}
-		characterCriticalIsuConditions := []*TrendCondition{}
-		for _, isu := range isuList {
-			var isuLastCondition IsuCondition
-			err = db.Get(&isuLastCondition,
-				"SELECT `timestamp`, `condition` FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY `timestamp` DESC LIMIT 1",
-				isu.JIAIsuUUID,
-			)
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					continue
-				}
-				c.Logger().Errorf("db error: %v", err)
-				return c.NoContent(http.StatusInternalServerError)
-			}
-
-			conditionLevel, err := calculateConditionLevel(isuLastCondition.Condition)
-			if err != nil {
-				c.Logger().Error(err)
-				return c.NoContent(http.StatusInternalServerError)
-			}
-			trendCondition := TrendCondition{
-				ID:        isu.ID,
-				Timestamp: isuLastCondition.Timestamp.Unix(),
-			}
-			switch conditionLevel {
-			case conditionLevelInfo:
-				characterInfoIsuConditions = append(characterInfoIsuConditions, &trendCondition)
-			case conditionLevelWarning:
-				characterWarningIsuConditions = append(characterWarningIsuConditions, &trendCondition)
-			case conditionLevelCritical:
-				characterCriticalIsuConditions = append(characterCriticalIsuConditions, &trendCondition)
-			}
+	res := []TrendResponse{}
+	for _, character := range characterList {
+		conditions := grouped[character.Character]
+		if conditions == nil {
+			conditions = newGroupedConditions()
 		}
 
-		sort.Slice(characterInfoIsuConditions, func(i, j int) bool {
-			return characterInfoIsuConditions[i].Timestamp > characterInfoIsuConditions[j].Timestamp
+		sort.Slice(conditions.info, func(i, j int) bool {
+			return conditions.info[i].Timestamp > conditions.info[j].Timestamp
 		})
-		sort.Slice(characterWarningIsuConditions, func(i, j int) bool {
-			return characterWarningIsuConditions[i].Timestamp > characterWarningIsuConditions[j].Timestamp
+		sort.Slice(conditions.warning, func(i, j int) bool {
+			return conditions.warning[i].Timestamp > conditions.warning[j].Timestamp
 		})
-		sort.Slice(characterCriticalIsuConditions, func(i, j int) bool {
-			return characterCriticalIsuConditions[i].Timestamp > characterCriticalIsuConditions[j].Timestamp
+		sort.Slice(conditions.critical, func(i, j int) bool {
+			return conditions.critical[i].Timestamp > conditions.critical[j].Timestamp
 		})
 		res = append(res,
 			TrendResponse{
 				Character: character.Character,
-				Info:      characterInfoIsuConditions,
-				Warning:   characterWarningIsuConditions,
-				Critical:  characterCriticalIsuConditions,
+				Info:      conditions.info,
+				Warning:   conditions.warning,
+				Critical:  conditions.critical,
 			})
 	}
 
