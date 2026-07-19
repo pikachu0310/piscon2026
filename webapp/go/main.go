@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"os/exec"
@@ -76,6 +78,13 @@ var (
 		loaded bool
 	}{uuids: make(map[string]struct{})}
 
+	jiaServiceConfig = struct {
+		sync.RWMutex
+		url string
+	}{url: defaultJIAServiceURL}
+
+	errDuplicateIsu = errors.New("duplicated: isu")
+
 	conditionHistoryCache = struct {
 		sync.RWMutex
 		histories map[string]*ConditionHistory
@@ -115,6 +124,13 @@ type Isu struct {
 
 type IsuFromJIA struct {
 	Character string `json:"character"`
+}
+
+type JIAActivationResult struct {
+	Isu        IsuFromJIA
+	StatusCode int
+	Body       []byte
+	Err        error
 }
 
 type GetIsuListResponse struct {
@@ -397,6 +413,40 @@ func cacheKnownIsu(jiaIsuUUID string) {
 	knownIsuCache.Unlock()
 }
 
+// reserveKnownIsu atomically rejects duplicate registrations and makes the
+// UUID visible to condition posts that may begin as soon as JIA is activated.
+func reserveKnownIsu(jiaIsuUUID string) (bool, error) {
+	knownIsuCache.Lock()
+	if knownIsuCache.loaded {
+		if _, ok := knownIsuCache.uuids[jiaIsuUUID]; ok {
+			knownIsuCache.Unlock()
+			return false, nil
+		}
+		knownIsuCache.uuids[jiaIsuUUID] = struct{}{}
+		knownIsuCache.Unlock()
+		return true, nil
+	}
+	knownIsuCache.Unlock()
+
+	known, err := isKnownIsu(jiaIsuUUID)
+	if err != nil || known {
+		return false, err
+	}
+	knownIsuCache.Lock()
+	defer knownIsuCache.Unlock()
+	if _, ok := knownIsuCache.uuids[jiaIsuUUID]; ok {
+		return false, nil
+	}
+	knownIsuCache.uuids[jiaIsuUUID] = struct{}{}
+	return true, nil
+}
+
+func unreserveKnownIsu(jiaIsuUUID string) {
+	knownIsuCache.Lock()
+	delete(knownIsuCache.uuids, jiaIsuUUID)
+	knownIsuCache.Unlock()
+}
+
 func isKnownIsu(jiaIsuUUID string) (bool, error) {
 	knownIsuCache.RLock()
 	_, ok := knownIsuCache.uuids[jiaIsuUUID]
@@ -590,16 +640,17 @@ func getUserIDFromSession(c echo.Context) (string, int, error) {
 	return jiaUserID, 0, nil
 }
 
-func getJIAServiceURL(tx *sqlx.Tx) string {
-	var config Config
-	err := tx.Get(&config, "SELECT * FROM `isu_association_config` WHERE `name` = ?", "jia_service_url")
-	if err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			log.Print(err)
-		}
-		return defaultJIAServiceURL
-	}
-	return config.URL
+func setJIAServiceURL(url string) {
+	jiaServiceConfig.Lock()
+	jiaServiceConfig.url = url
+	jiaServiceConfig.Unlock()
+}
+
+func getJIAServiceURL() string {
+	jiaServiceConfig.RLock()
+	url := jiaServiceConfig.url
+	jiaServiceConfig.RUnlock()
+	return url
 }
 
 // POST /initialize
@@ -638,6 +689,7 @@ func postInitialize(c echo.Context) error {
 		c.Logger().Errorf("db error : %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
+	setJIAServiceURL(request.JIAServiceURL)
 
 	if err = reloadKnownIsus(); err != nil {
 		c.Logger().Errorf("db error: %v", err)
@@ -820,6 +872,101 @@ func getIsuList(c echo.Context) error {
 
 // POST /api/isu
 // ISUを登録
+func parseIsuRegistration(reader *multipart.Reader, onIdentity func(string, string) error) (string, string, []byte, bool, error) {
+	var jiaIsuUUID, isuName string
+	var image []byte
+	uuidSeen, nameSeen, identityHandled := false, false, false
+	useDefaultImage := true
+
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return "", "", nil, false, err
+		}
+
+		switch part.FormName() {
+		case "jia_isu_uuid":
+			if !uuidSeen {
+				value, readErr := ioutil.ReadAll(io.LimitReader(part, 1<<20))
+				if readErr != nil {
+					part.Close()
+					return "", "", nil, false, readErr
+				}
+				jiaIsuUUID = string(value)
+				uuidSeen = true
+			}
+		case "isu_name":
+			if !nameSeen {
+				value, readErr := ioutil.ReadAll(io.LimitReader(part, 1<<20))
+				if readErr != nil {
+					part.Close()
+					return "", "", nil, false, readErr
+				}
+				isuName = string(value)
+				nameSeen = true
+			}
+		case "image":
+			if part.FileName() != "" {
+				value, readErr := ioutil.ReadAll(part)
+				if readErr != nil {
+					part.Close()
+					return "", "", nil, false, readErr
+				}
+				image = value
+				useDefaultImage = false
+			}
+		}
+		part.Close()
+
+		// The official client writes UUID and name before the image. Start JIA's
+		// fixed activation wait here while the potentially large image arrives.
+		if uuidSeen && nameSeen && !identityHandled {
+			if err = onIdentity(jiaIsuUUID, isuName); err != nil {
+				return "", "", nil, false, err
+			}
+			identityHandled = true
+		}
+	}
+
+	if !identityHandled {
+		if err := onIdentity(jiaIsuUUID, isuName); err != nil {
+			return "", "", nil, false, err
+		}
+	}
+	return jiaIsuUUID, isuName, image, useDefaultImage, nil
+}
+
+func activateIsu(jiaIsuUUID string) JIAActivationResult {
+	targetURL := getJIAServiceURL() + "/api/activate"
+	bodyJSON, err := json.Marshal(JIAServiceRequest{postIsuConditionTargetBaseURL, jiaIsuUUID})
+	if err != nil {
+		return JIAActivationResult{Err: err}
+	}
+	reqJIA, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewBuffer(bodyJSON))
+	if err != nil {
+		return JIAActivationResult{Err: err}
+	}
+	reqJIA.Header.Set("Content-Type", "application/json")
+	res, err := http.DefaultClient.Do(reqJIA)
+	if err != nil {
+		return JIAActivationResult{Err: err}
+	}
+	defer res.Body.Close()
+
+	resBody, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return JIAActivationResult{Err: err}
+	}
+	result := JIAActivationResult{StatusCode: res.StatusCode, Body: resBody}
+	if res.StatusCode == http.StatusAccepted {
+		result.Err = json.Unmarshal(resBody, &result.Isu)
+	}
+	return result
+}
+
 func postIsu(c echo.Context) error {
 	jiaUserID, errStatusCode, err := getUserIDFromSession(c)
 	if err != nil {
@@ -831,19 +978,42 @@ func postIsu(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	useDefaultImage := false
-
-	jiaIsuUUID := c.FormValue("jia_isu_uuid")
-	isuName := c.FormValue("isu_name")
-	fh, err := c.FormFile("image")
+	multipartReader, err := c.Request().MultipartReader()
 	if err != nil {
-		if !errors.Is(err, http.ErrMissingFile) {
-			return c.String(http.StatusBadRequest, "bad format: icon")
-		}
-		useDefaultImage = true
+		return c.String(http.StatusBadRequest, "bad format: icon")
 	}
 
-	var image []byte
+	activation := make(chan JIAActivationResult, 1)
+	reserved := false
+	registrationComplete := false
+	var reservedUUID string
+	jiaIsuUUID, isuName, image, useDefaultImage, err := parseIsuRegistration(multipartReader, func(uuid, _ string) error {
+		ok, reserveErr := reserveKnownIsu(uuid)
+		if reserveErr != nil {
+			return reserveErr
+		}
+		if !ok {
+			return errDuplicateIsu
+		}
+		reserved = true
+		reservedUUID = uuid
+		go func() { activation <- activateIsu(uuid) }()
+		return nil
+	})
+	if reserved {
+		defer func() {
+			if !registrationComplete {
+				unreserveKnownIsu(reservedUUID)
+			}
+		}()
+	}
+	if errors.Is(err, errDuplicateIsu) {
+		return c.String(http.StatusConflict, "duplicated: isu")
+	}
+	if err != nil {
+		c.Logger().Error(err)
+		return c.String(http.StatusBadRequest, "bad format: icon")
+	}
 
 	if useDefaultImage {
 		image, err = ioutil.ReadFile(defaultIconFilePath)
@@ -851,105 +1021,36 @@ func postIsu(c echo.Context) error {
 			c.Logger().Error(err)
 			return c.NoContent(http.StatusInternalServerError)
 		}
-	} else {
-		file, err := fh.Open()
-		if err != nil {
-			c.Logger().Error(err)
-			return c.NoContent(http.StatusInternalServerError)
-		}
-		defer file.Close()
-
-		image, err = ioutil.ReadAll(file)
-		if err != nil {
-			c.Logger().Error(err)
-			return c.NoContent(http.StatusInternalServerError)
-		}
 	}
 
-	tx, err := db.Beginx()
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
+	activationResult := <-activation
+	if activationResult.Err != nil {
+		c.Logger().Errorf("failed to request to JIAService: %v", activationResult.Err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
-	defer tx.Rollback()
+	if activationResult.StatusCode != http.StatusAccepted {
+		c.Logger().Errorf("JIAService returned error: status code %v, message: %v", activationResult.StatusCode, string(activationResult.Body))
+		return c.String(activationResult.StatusCode, "JIAService returned error")
+	}
 
-	_, err = tx.Exec("INSERT INTO `isu`"+
-		"	(`jia_isu_uuid`, `name`, `image`, `jia_user_id`) VALUES (?, ?, ?, ?)",
-		jiaIsuUUID, isuName, image, jiaUserID)
+	result, err := db.Exec("INSERT INTO `isu`"+
+		" (`jia_isu_uuid`, `name`, `image`, `character`, `jia_user_id`) VALUES (?, ?, ?, ?, ?)",
+		jiaIsuUUID, isuName, image, activationResult.Isu.Character, jiaUserID)
 	if err != nil {
 		mysqlErr, ok := err.(*mysql.MySQLError)
-
 		if ok && mysqlErr.Number == uint16(mysqlErrNumDuplicateEntry) {
 			return c.String(http.StatusConflict, "duplicated: isu")
 		}
-
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
-
-	targetURL := getJIAServiceURL(tx) + "/api/activate"
-	body := JIAServiceRequest{postIsuConditionTargetBaseURL, jiaIsuUUID}
-	bodyJSON, err := json.Marshal(body)
-	if err != nil {
-		c.Logger().Error(err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-
-	reqJIA, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewBuffer(bodyJSON))
-	if err != nil {
-		c.Logger().Error(err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-
-	reqJIA.Header.Set("Content-Type", "application/json")
-	res, err := http.DefaultClient.Do(reqJIA)
-	if err != nil {
-		c.Logger().Errorf("failed to request to JIAService: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-	defer res.Body.Close()
-
-	resBody, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		c.Logger().Error(err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-
-	if res.StatusCode != http.StatusAccepted {
-		c.Logger().Errorf("JIAService returned error: status code %v, message: %v", res.StatusCode, string(resBody))
-		return c.String(res.StatusCode, "JIAService returned error")
-	}
-
-	var isuFromJIA IsuFromJIA
-	err = json.Unmarshal(resBody, &isuFromJIA)
-	if err != nil {
-		c.Logger().Error(err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-
-	_, err = tx.Exec("UPDATE `isu` SET `character` = ? WHERE  `jia_isu_uuid` = ?", isuFromJIA.Character, jiaIsuUUID)
+	id, err := result.LastInsertId()
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
-
-	var isu Isu
-	err = tx.Get(
-		&isu,
-		"SELECT `id`, `jia_isu_uuid`, `name`, `character` FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
-		jiaUserID, jiaIsuUUID)
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-
-	err = tx.Commit()
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-
-	cacheKnownIsu(jiaIsuUUID)
+	isu := Isu{ID: int(id), JIAIsuUUID: jiaIsuUUID, Name: isuName, Character: activationResult.Isu.Character}
+	registrationComplete = true
 	cacheIsuIcon(jiaUserID, jiaIsuUUID, image)
 	invalidateTrendCache()
 	return c.JSON(http.StatusCreated, isu)
