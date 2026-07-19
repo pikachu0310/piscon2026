@@ -58,6 +58,11 @@ var (
 		body      []byte
 		expiresAt time.Time
 	}{}
+
+	sessionCache = struct {
+		sync.RWMutex
+		users map[string]string
+	}{users: make(map[string]string)}
 )
 
 type Config struct {
@@ -300,7 +305,33 @@ func invalidateTrendCache() {
 	trendCache.Unlock()
 }
 
+func clearSessionCache() {
+	sessionCache.Lock()
+	sessionCache.users = make(map[string]string)
+	sessionCache.Unlock()
+}
+
+func deleteCachedSession(r *http.Request) {
+	cookie, err := r.Cookie(sessionName)
+	if err != nil {
+		return
+	}
+	sessionCache.Lock()
+	delete(sessionCache.users, cookie.Value)
+	sessionCache.Unlock()
+}
+
 func getUserIDFromSession(c echo.Context) (string, int, error) {
+	cookie, cookieErr := c.Request().Cookie(sessionName)
+	if cookieErr == nil {
+		sessionCache.RLock()
+		jiaUserID, ok := sessionCache.users[cookie.Value]
+		sessionCache.RUnlock()
+		if ok {
+			return jiaUserID, 0, nil
+		}
+	}
+
 	session, err := getSession(c.Request())
 	if err != nil {
 		return "", http.StatusInternalServerError, fmt.Errorf("failed to get session: %v", err)
@@ -310,7 +341,10 @@ func getUserIDFromSession(c echo.Context) (string, int, error) {
 		return "", http.StatusUnauthorized, fmt.Errorf("no session")
 	}
 
-	jiaUserID := _jiaUserID.(string)
+	jiaUserID, ok := _jiaUserID.(string)
+	if !ok {
+		return "", http.StatusUnauthorized, fmt.Errorf("invalid session")
+	}
 	var count int
 
 	err = db.Get(&count, "SELECT COUNT(*) FROM `user` WHERE `jia_user_id` = ?",
@@ -321,6 +355,12 @@ func getUserIDFromSession(c echo.Context) (string, int, error) {
 
 	if count == 0 {
 		return "", http.StatusUnauthorized, fmt.Errorf("not found: user")
+	}
+
+	if cookieErr == nil {
+		sessionCache.Lock()
+		sessionCache.users[cookie.Value] = jiaUserID
+		sessionCache.Unlock()
 	}
 
 	return jiaUserID, 0, nil
@@ -379,6 +419,7 @@ func postInitialize(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
+	clearSessionCache()
 	invalidateTrendCache()
 	notifyInitializeCapture()
 	return c.JSON(http.StatusOK, InitializeResponse{
@@ -440,6 +481,7 @@ func postAuthentication(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
+	deleteCachedSession(c.Request())
 	return c.NoContent(http.StatusOK)
 }
 
@@ -469,6 +511,7 @@ func postSignout(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
+	deleteCachedSession(c.Request())
 	return c.NoContent(http.StatusOK)
 }
 
