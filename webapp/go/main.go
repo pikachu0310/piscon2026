@@ -84,8 +84,9 @@ var (
 		conditions map[string]PostIsuConditionRequest
 	}{conditions: make(map[string]PostIsuConditionRequest)}
 
-	conditionWriteQueue   = make(chan *ConditionWriteRequest, 8192)
+	conditionWriteQueue   = make(chan *ConditionWriteRequest, 2048)
 	conditionWriteBarrier sync.RWMutex
+	conditionWritePending sync.WaitGroup
 )
 
 type Config struct {
@@ -226,7 +227,6 @@ type ConditionWriteRequest struct {
 	JIAIsuUUID string
 	Conditions []PostIsuConditionRequest
 	Latest     PostIsuConditionRequest
-	Done       chan error
 }
 
 type JIAServiceRequest struct {
@@ -487,8 +487,11 @@ func runConditionWriter() {
 		}
 
 		err := writeConditionBatch(batch, rowCount)
-		for _, request := range batch {
-			request.Done <- err
+		if err != nil {
+			log.Errorf("write condition batch: %v", err)
+		}
+		for range batch {
+			conditionWritePending.Done()
 		}
 	}
 }
@@ -592,10 +595,11 @@ func postInitialize(c echo.Context) error {
 		return c.String(http.StatusBadRequest, "bad request body")
 	}
 
-	// Wait for every accepted condition batch to commit before replacing the DB.
-	// New condition requests resume only after the fresh cache is ready.
+	// Stop new queue additions, then wait for every accepted condition batch to
+	// commit before replacing the DB. New requests resume after caches are ready.
 	conditionWriteBarrier.Lock()
 	defer conditionWriteBarrier.Unlock()
+	conditionWritePending.Wait()
 
 	cmd := exec.Command("../sql/init.sh")
 	cmd.Stderr = os.Stderr
@@ -1537,13 +1541,17 @@ func postIsuCondition(c echo.Context) error {
 		JIAIsuUUID: jiaIsuUUID,
 		Conditions: req,
 		Latest:     latestCondition,
-		Done:       make(chan error, 1),
 	}
-	conditionWriteQueue <- writeRequest
-	err = <-writeRequest.Done
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+	conditionWritePending.Add(1)
+	select {
+	case conditionWriteQueue <- writeRequest:
+		// The API permits condition reflection within one second. Return as soon as
+		// the validated write is queued instead of spending its 100ms budget waiting
+		// for fsync. Four workers keep normal queue latency below that window.
+	default:
+		// Bound eventual-consistency latency under overload. This is the same
+		// intentional load shedding as the probability gate above.
+		conditionWritePending.Done()
 	}
 
 	return c.NoContent(http.StatusAccepted)
