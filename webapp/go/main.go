@@ -49,6 +49,7 @@ var (
 	sessionStore        sessions.Store
 	mySQLConnectionData *MySQLConnectionEnv
 	conditionJSON       = jsoniter.ConfigCompatibleWithStandardLibrary
+	jiaHTTPClient       = newJIAHTTPClient()
 
 	jiaJWTSigningKey *ecdsa.PublicKey
 
@@ -254,6 +255,13 @@ func NewMySQLConnectionEnv() *MySQLConnectionEnv {
 func (mc *MySQLConnectionEnv) ConnectDB() (*sqlx.DB, error) {
 	dsn := fmt.Sprintf("%v:%v@tcp(%v:%v)/%v?parseTime=true&loc=Asia%%2FTokyo&interpolateParams=true", mc.User, mc.Password, mc.Host, mc.Port, mc.DBName)
 	return sqlx.Open("mysql", dsn)
+}
+
+func newJIAHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 256
+	transport.MaxIdleConnsPerHost = 256
+	return &http.Client{Transport: transport}
 }
 
 func init() {
@@ -902,7 +910,7 @@ func postIsu(c echo.Context) error {
 	}
 
 	reqJIA.Header.Set("Content-Type", "application/json")
-	res, err := http.DefaultClient.Do(reqJIA)
+	res, err := jiaHTTPClient.Do(reqJIA)
 	if err != nil {
 		c.Logger().Errorf("failed to request to JIAService: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
