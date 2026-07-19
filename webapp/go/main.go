@@ -68,6 +68,12 @@ var (
 		sync.RWMutex
 		images map[string][]byte
 	}{images: make(map[string][]byte)}
+
+	knownIsuCache = struct {
+		sync.RWMutex
+		uuids  map[string]struct{}
+		loaded bool
+	}{uuids: make(map[string]struct{})}
 )
 
 type Config struct {
@@ -342,6 +348,48 @@ func cacheIsuIcon(jiaUserID string, jiaIsuUUID string, image []byte) {
 	iconCache.Unlock()
 }
 
+func reloadKnownIsus() error {
+	var uuids []string
+	if err := db.Select(&uuids, "SELECT `jia_isu_uuid` FROM `isu`"); err != nil {
+		return err
+	}
+
+	known := make(map[string]struct{}, len(uuids))
+	for _, uuid := range uuids {
+		known[uuid] = struct{}{}
+	}
+
+	knownIsuCache.Lock()
+	knownIsuCache.uuids = known
+	knownIsuCache.loaded = true
+	knownIsuCache.Unlock()
+	return nil
+}
+
+func cacheKnownIsu(jiaIsuUUID string) {
+	knownIsuCache.Lock()
+	knownIsuCache.uuids[jiaIsuUUID] = struct{}{}
+	knownIsuCache.Unlock()
+}
+
+func isKnownIsu(jiaIsuUUID string) (bool, error) {
+	knownIsuCache.RLock()
+	_, ok := knownIsuCache.uuids[jiaIsuUUID]
+	loaded := knownIsuCache.loaded
+	knownIsuCache.RUnlock()
+	if loaded {
+		return ok, nil
+	}
+
+	// Before the first initialize after a process restart, preserve the original
+	// behavior by consulting the database instead of trusting an empty cache.
+	var count int
+	if err := db.Get(&count, "SELECT COUNT(*) FROM `isu` WHERE `jia_isu_uuid` = ?", jiaIsuUUID); err != nil {
+		return false, err
+	}
+	return count != 0, nil
+}
+
 func getUserIDFromSession(c echo.Context) (string, int, error) {
 	cookie, cookieErr := c.Request().Cookie(sessionName)
 	if cookieErr == nil {
@@ -437,6 +485,11 @@ func postInitialize(c echo.Context) error {
 	)
 	if err != nil {
 		c.Logger().Errorf("db error : %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+
+	if err = reloadKnownIsus(); err != nil {
+		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
@@ -745,6 +798,7 @@ func postIsu(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
+	cacheKnownIsu(jiaIsuUUID)
 	cacheIsuIcon(jiaUserID, jiaIsuUUID, image)
 	invalidateTrendCache()
 	return c.JSON(http.StatusCreated, isu)
@@ -1318,13 +1372,12 @@ func postIsuCondition(c echo.Context) error {
 	}
 	defer tx.Rollback()
 
-	var count int
-	err = tx.Get(&count, "SELECT COUNT(*) FROM `isu` WHERE `jia_isu_uuid` = ?", jiaIsuUUID)
+	known, err := isKnownIsu(jiaIsuUUID)
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
-	if count == 0 {
+	if !known {
 		return c.String(http.StatusNotFound, "not found: isu")
 	}
 
