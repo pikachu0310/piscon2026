@@ -30,3 +30,17 @@ func TestConditionJSONMatchesStandardLibrary(t *testing.T) {
 		}
 	}
 }
+
+func TestConditionJSONDoesNotAliasInput(t *testing.T) {
+	body := []byte(`[{"message":"stable","timestamp":1620000001,"condition":"is_dirty=false,is_overweight=false,is_broken=false","is_sitting":true}]`)
+	var conditions []CachedCondition
+	if err := conditionJSON.Unmarshal(body, &conditions); err != nil {
+		t.Fatal(err)
+	}
+	for i := range body {
+		body[i] = 'x'
+	}
+	if got := conditions[0].Message; got != "stable" {
+		t.Fatalf("decoded string aliases reusable request buffer: got %q", got)
+	}
+}
