@@ -63,6 +63,11 @@ var (
 		sync.RWMutex
 		users map[string]string
 	}{users: make(map[string]string)}
+
+	iconCache = struct {
+		sync.RWMutex
+		images map[string][]byte
+	}{images: make(map[string][]byte)}
 )
 
 type Config struct {
@@ -321,6 +326,22 @@ func deleteCachedSession(r *http.Request) {
 	sessionCache.Unlock()
 }
 
+func iconCacheKey(jiaUserID string, jiaIsuUUID string) string {
+	return jiaUserID + "\x00" + jiaIsuUUID
+}
+
+func clearIconCache() {
+	iconCache.Lock()
+	iconCache.images = make(map[string][]byte)
+	iconCache.Unlock()
+}
+
+func cacheIsuIcon(jiaUserID string, jiaIsuUUID string, image []byte) {
+	iconCache.Lock()
+	iconCache.images[iconCacheKey(jiaUserID, jiaIsuUUID)] = image
+	iconCache.Unlock()
+}
+
 func getUserIDFromSession(c echo.Context) (string, int, error) {
 	cookie, cookieErr := c.Request().Cookie(sessionName)
 	if cookieErr == nil {
@@ -420,6 +441,7 @@ func postInitialize(c echo.Context) error {
 	}
 
 	clearSessionCache()
+	clearIconCache()
 	invalidateTrendCache()
 	notifyInitializeCapture()
 	return c.JSON(http.StatusOK, InitializeResponse{
@@ -723,6 +745,7 @@ func postIsu(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
+	cacheIsuIcon(jiaUserID, jiaIsuUUID, image)
 	invalidateTrendCache()
 	return c.JSON(http.StatusCreated, isu)
 }
@@ -771,8 +794,14 @@ func getIsuIcon(c echo.Context) error {
 	}
 
 	jiaIsuUUID := c.Param("jia_isu_uuid")
+	cacheKey := iconCacheKey(jiaUserID, jiaIsuUUID)
+	iconCache.RLock()
+	image, ok := iconCache.images[cacheKey]
+	iconCache.RUnlock()
+	if ok {
+		return c.Blob(http.StatusOK, "", image)
+	}
 
-	var image []byte
 	err = db.Get(&image, "SELECT `image` FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
 		jiaUserID, jiaIsuUUID)
 	if err != nil {
@@ -784,6 +813,7 @@ func getIsuIcon(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
+	cacheIsuIcon(jiaUserID, jiaIsuUUID, image)
 	return c.Blob(http.StatusOK, "", image)
 }
 
