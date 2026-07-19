@@ -333,6 +333,7 @@ func postInitialize(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
+	notifyInitializeCapture()
 	return c.JSON(http.StatusOK, InitializeResponse{
 		Language: "go",
 	})

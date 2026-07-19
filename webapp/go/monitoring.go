@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/felixge/fgprof"
 	"github.com/labstack/echo/v4"
 )
 
@@ -21,6 +22,7 @@ import (
 // Keeping this disabled outside a profile avoids allocating a label/context on
 // every competition request merely because the diagnostics server exists.
 var routeLabelsActive uint32
+var fgprofRunning uint32
 
 // profilingMiddleware adds only low-cardinality route templates to CPU and
 // goroutine profiles. Never use the raw URL here: it contains UUIDs and would
@@ -53,6 +55,30 @@ func cpuProfileHandler(w http.ResponseWriter, r *http.Request) {
 	httppprof.Profile(w, r)
 }
 
+func fgprofHandler(w http.ResponseWriter, r *http.Request) {
+	if !atomic.CompareAndSwapUint32(&fgprofRunning, 0, 1) {
+		http.Error(w, "fgprof is already running", http.StatusConflict)
+		return
+	}
+	defer atomic.StoreUint32(&fgprofRunning, 0)
+	fgprof.Handler().ServeHTTP(w, r)
+}
+
+// notifyInitializeCapture is deliberately fail-open: observability must never
+// make the benchmark's initialize fail. The loopback UDP write completes in a
+// few microseconds and wakes the collector before the success response leaves
+// the application. Nginx's dedicated initialize log is the fallback.
+func notifyInitializeCapture() {
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: getEnvInt("ISUOBSERVE_TRIGGER_PORT", 21610)}
+	conn, err := net.DialUDP("udp4", nil, addr)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Millisecond))
+	_, _ = fmt.Fprintf(conn, "initialize\t%d\n", time.Now().UnixNano())
+}
+
 // startDiagnosticsServer exposes machine-readable diagnostics on loopback.
 // PROFILE_ADDR=off disables it. Do not bind this server to a public address:
 // pprof output can reveal implementation details.
@@ -81,6 +107,7 @@ func startDiagnosticsServer(logger echo.Logger) {
 	mux.HandleFunc("/debug/pprof/profile", cpuProfileHandler)
 	mux.HandleFunc("/debug/pprof/symbol", httppprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
+	mux.HandleFunc("/debug/fgprof", fgprofHandler)
 	mux.HandleFunc("/debug/runtime-metrics", runtimeMetricsHandler)
 	mux.HandleFunc("/debug/db-stats", dbStatsHandler)
 	mux.HandleFunc("/debug/healthz", func(w http.ResponseWriter, _ *http.Request) {
