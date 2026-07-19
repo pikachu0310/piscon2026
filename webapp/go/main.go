@@ -80,6 +80,18 @@ var (
 		loaded    bool
 	}{histories: make(map[string]*ConditionHistory)}
 
+	canonicalConditionStrings = map[string]string{
+		"is_dirty=false,is_overweight=false,is_broken=false": "is_dirty=false,is_overweight=false,is_broken=false",
+		"is_dirty=true,is_overweight=false,is_broken=false":  "is_dirty=true,is_overweight=false,is_broken=false",
+		"is_dirty=false,is_overweight=true,is_broken=false":  "is_dirty=false,is_overweight=true,is_broken=false",
+		"is_dirty=true,is_overweight=true,is_broken=false":   "is_dirty=true,is_overweight=true,is_broken=false",
+		"is_dirty=false,is_overweight=false,is_broken=true":  "is_dirty=false,is_overweight=false,is_broken=true",
+		"is_dirty=true,is_overweight=false,is_broken=true":   "is_dirty=true,is_overweight=false,is_broken=true",
+		"is_dirty=false,is_overweight=true,is_broken=true":   "is_dirty=false,is_overweight=true,is_broken=true",
+		"is_dirty=true,is_overweight=true,is_broken=true":    "is_dirty=true,is_overweight=true,is_broken=true",
+	}
+	conditionMessageInterner sync.Map
+
 	conditionWriteBarrier sync.RWMutex
 )
 
@@ -123,7 +135,14 @@ type IsuCondition struct {
 
 type ConditionHistory struct {
 	sync.RWMutex
-	conditions []IsuCondition
+	conditions []CachedCondition
+}
+
+type CachedCondition struct {
+	Timestamp int64
+	Condition string
+	Message   string
+	IsSitting bool
 }
 
 type MySQLConnectionEnv struct {
@@ -415,7 +434,7 @@ func snapshotLatestConditions() map[string]PostIsuConditionRequest {
 		if len(history.conditions) != 0 {
 			latest := history.conditions[len(history.conditions)-1]
 			conditions[uuid] = PostIsuConditionRequest{
-				Timestamp: latest.Timestamp.Unix(),
+				Timestamp: latest.Timestamp,
 				IsSitting: latest.IsSitting,
 				Condition: latest.Condition,
 				Message:   latest.Message,
@@ -446,7 +465,16 @@ func reloadConditionHistories() error {
 			history = &ConditionHistory{}
 			histories[condition.JIAIsuUUID] = history
 		}
-		history.conditions = append(history.conditions, condition)
+		canonical, ok := canonicalConditionStrings[condition.Condition]
+		if !ok {
+			return fmt.Errorf("invalid condition in baseline: %q", condition.Condition)
+		}
+		history.conditions = append(history.conditions, CachedCondition{
+			Timestamp: condition.Timestamp.Unix(),
+			Condition: canonical,
+			Message:   internConditionMessage(condition.Message),
+			IsSitting: condition.IsSitting,
+		})
 	}
 	if err = rows.Err(); err != nil {
 		return err
@@ -457,6 +485,11 @@ func reloadConditionHistories() error {
 	conditionHistoryCache.loaded = true
 	conditionHistoryCache.Unlock()
 	return nil
+}
+
+func internConditionMessage(message string) string {
+	value, _ := conditionMessageInterner.LoadOrStore(message, message)
+	return value.(string)
 }
 
 func getOrCreateConditionHistory(jiaIsuUUID string) *ConditionHistory {
@@ -479,33 +512,32 @@ func getOrCreateConditionHistory(jiaIsuUUID string) *ConditionHistory {
 
 func cacheConditionHistory(jiaIsuUUID string, requestConditions []PostIsuConditionRequest) {
 	history := getOrCreateConditionHistory(jiaIsuUUID)
-	conditions := make([]IsuCondition, len(requestConditions))
+	conditions := make([]CachedCondition, len(requestConditions))
 	for i, condition := range requestConditions {
-		conditions[i] = IsuCondition{
-			JIAIsuUUID: jiaIsuUUID,
-			Timestamp:  time.Unix(condition.Timestamp, 0),
-			IsSitting:  condition.IsSitting,
-			Condition:  condition.Condition,
-			Message:    condition.Message,
+		conditions[i] = CachedCondition{
+			Timestamp: condition.Timestamp,
+			IsSitting: condition.IsSitting,
+			Condition: condition.Condition,
+			Message:   condition.Message,
 		}
 	}
 	sort.SliceStable(conditions, func(i, j int) bool {
-		return conditions[i].Timestamp.Before(conditions[j].Timestamp)
+		return conditions[i].Timestamp < conditions[j].Timestamp
 	})
 
 	history.Lock()
 	needsSort := len(history.conditions) > 0 && len(conditions) > 0 &&
-		conditions[0].Timestamp.Before(history.conditions[len(history.conditions)-1].Timestamp)
+		conditions[0].Timestamp < history.conditions[len(history.conditions)-1].Timestamp
 	history.conditions = append(history.conditions, conditions...)
 	if needsSort {
 		sort.SliceStable(history.conditions, func(i, j int) bool {
-			return history.conditions[i].Timestamp.Before(history.conditions[j].Timestamp)
+			return history.conditions[i].Timestamp < history.conditions[j].Timestamp
 		})
 	}
 	history.Unlock()
 }
 
-func conditionHistoryRange(jiaIsuUUID string, startTime, endTime time.Time) ([]IsuCondition, bool) {
+func conditionHistoryRange(jiaIsuUUID string, startTime, endTime time.Time) ([]CachedCondition, bool) {
 	conditionHistoryCache.RLock()
 	loaded := conditionHistoryCache.loaded
 	history := conditionHistoryCache.histories[jiaIsuUUID]
@@ -514,18 +546,20 @@ func conditionHistoryRange(jiaIsuUUID string, startTime, endTime time.Time) ([]I
 		return nil, false
 	}
 	if history == nil {
-		return []IsuCondition{}, true
+		return []CachedCondition{}, true
 	}
 
 	history.RLock()
 	defer history.RUnlock()
+	startUnix := startTime.Unix()
+	endUnix := endTime.Unix()
 	start := sort.Search(len(history.conditions), func(i int) bool {
-		return !history.conditions[i].Timestamp.Before(startTime)
+		return history.conditions[i].Timestamp >= startUnix
 	})
 	end := sort.Search(len(history.conditions), func(i int) bool {
-		return !history.conditions[i].Timestamp.Before(endTime)
+		return history.conditions[i].Timestamp >= endUnix
 	})
-	conditions := make([]IsuCondition, end-start)
+	conditions := make([]CachedCondition, end-start)
 	copy(conditions, history.conditions[start:end])
 	return conditions, true
 }
@@ -1054,13 +1088,13 @@ func getIsuGraph(c echo.Context) error {
 // グラフのデータ点を一日分生成
 func generateIsuGraphResponse(db *sqlx.DB, jiaIsuUUID string, graphDate time.Time) ([]GraphResponse, error) {
 	dataPoints := []GraphDataPointWithInfo{}
-	conditionsInThisHour := []IsuCondition{}
+	conditionsInThisHour := []CachedCondition{}
 	timestampsInThisHour := []int64{}
 	var startTimeInThisHour time.Time
 
 	conditions, loaded := conditionHistoryRange(jiaIsuUUID, graphDate, graphDate.Add(24*time.Hour))
 	if !loaded {
-		conditions = []IsuCondition{}
+		conditions = []CachedCondition{}
 		rows, err := db.Queryx(
 			"SELECT `jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message` FROM `isu_condition`"+
 				" WHERE `jia_isu_uuid` = ? AND `timestamp` >= ? AND `timestamp` < ? ORDER BY `timestamp` ASC",
@@ -1074,12 +1108,21 @@ func generateIsuGraphResponse(db *sqlx.DB, jiaIsuUUID string, graphDate time.Tim
 			if err = rows.StructScan(&condition); err != nil {
 				return nil, err
 			}
-			conditions = append(conditions, condition)
+			canonical, ok := canonicalConditionStrings[condition.Condition]
+			if !ok {
+				return nil, fmt.Errorf("invalid condition: %q", condition.Condition)
+			}
+			conditions = append(conditions, CachedCondition{
+				Timestamp: condition.Timestamp.Unix(),
+				Condition: canonical,
+				Message:   internConditionMessage(condition.Message),
+				IsSitting: condition.IsSitting,
+			})
 		}
 	}
 
 	for _, condition := range conditions {
-		truncatedConditionTime := condition.Timestamp.Truncate(time.Hour)
+		truncatedConditionTime := time.Unix(condition.Timestamp, 0).Truncate(time.Hour)
 		if truncatedConditionTime != startTimeInThisHour {
 			if len(conditionsInThisHour) > 0 {
 				data, err := calculateGraphDataPoint(conditionsInThisHour)
@@ -1096,11 +1139,11 @@ func generateIsuGraphResponse(db *sqlx.DB, jiaIsuUUID string, graphDate time.Tim
 			}
 
 			startTimeInThisHour = truncatedConditionTime
-			conditionsInThisHour = []IsuCondition{}
+			conditionsInThisHour = []CachedCondition{}
 			timestampsInThisHour = []int64{}
 		}
 		conditionsInThisHour = append(conditionsInThisHour, condition)
-		timestampsInThisHour = append(timestampsInThisHour, condition.Timestamp.Unix())
+		timestampsInThisHour = append(timestampsInThisHour, condition.Timestamp)
 	}
 
 	if len(conditionsInThisHour) > 0 {
@@ -1167,7 +1210,7 @@ func generateIsuGraphResponse(db *sqlx.DB, jiaIsuUUID string, graphDate time.Tim
 }
 
 // 複数のISUのコンディションからグラフの一つのデータ点を計算
-func calculateGraphDataPoint(isuConditions []IsuCondition) (GraphDataPoint, error) {
+func calculateGraphDataPoint(isuConditions []CachedCondition) (GraphDataPoint, error) {
 	conditionsCount := map[string]int{"is_broken": 0, "is_dirty": 0, "is_overweight": 0}
 	rawScore := 0
 	for _, condition := range isuConditions {
@@ -1314,14 +1357,16 @@ func getIsuConditionsFromCache(jiaIsuUUID string, endTime time.Time, conditionLe
 	}
 
 	response := make([]*GetIsuConditionResponse, 0, limit)
+	endUnix := endTime.Unix()
+	startUnix := startTime.Unix()
 	history.RLock()
 	defer history.RUnlock()
 	for i := len(history.conditions) - 1; i >= 0 && len(response) < limit; i-- {
 		condition := history.conditions[i]
-		if !condition.Timestamp.Before(endTime) {
+		if condition.Timestamp >= endUnix {
 			continue
 		}
-		if !startTime.IsZero() && condition.Timestamp.Before(startTime) {
+		if !startTime.IsZero() && condition.Timestamp < startUnix {
 			break
 		}
 		if _, ok := allowed[condition.Condition]; !ok {
@@ -1332,9 +1377,9 @@ func getIsuConditionsFromCache(jiaIsuUUID string, endTime time.Time, conditionLe
 			continue
 		}
 		response = append(response, &GetIsuConditionResponse{
-			JIAIsuUUID:     condition.JIAIsuUUID,
+			JIAIsuUUID:     jiaIsuUUID,
 			IsuName:        isuName,
-			Timestamp:      condition.Timestamp.Unix(),
+			Timestamp:      condition.Timestamp,
 			IsSitting:      condition.IsSitting,
 			Condition:      condition.Condition,
 			ConditionLevel: level,
@@ -1569,10 +1614,13 @@ func postIsuCondition(c echo.Context) error {
 		return c.String(http.StatusNotFound, "not found: isu")
 	}
 
-	for _, cond := range req {
-		if !isValidConditionFormat(cond.Condition) {
+	for i := range req {
+		canonical, ok := canonicalConditionStrings[req[i].Condition]
+		if !ok {
 			return c.String(http.StatusBadRequest, "bad request body")
 		}
+		req[i].Condition = canonical
+		req[i].Message = internConditionMessage(req[i].Message)
 	}
 
 	// During the one-minute scoring phase, the memory history is authoritative.
