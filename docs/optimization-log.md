@@ -834,3 +834,10 @@ slow/access/pprof/fgprof/OS計測だけを根拠に次の改善を選ぶ。
 - 計測runは3台共通の`20260719T141134.313843Z-s1-8b0eb6`。s1のaccess logは181,186,638 bytes、s2のslow logは38,632,063 bytes、s3のCPU pprofは96,439 bytes、fgprofは70,650 bytesだった。
 - s1/s2/s3の全runが`ANALYZED`で、全`errors.txt`は空。role-awareへ修正したdoctorも、s1のcoordinator watcherだけactive、s2/s3はinactiveという意図した構成を検証できた。
 - scoreのrun間変動を考慮し、以降はofficial scoreだけでなく、endpoint処理数・tail latency・profiler sample・OS指標が仮説どおり動いたかも採否に使う。
+
+### E50 expectation
+
+- B49ではs2 DBが平均83.0% idle、全40,257 queryの実行時間合計も4.27秒であり、DB本体は飽和していない。一方fgprofでは`GET /api/trend`のcache mutex待ちが44.42 goroutine秒、そのlock内のremote SQLが2.60秒、`GET /api/condition/:uuid`の所有権/name SQL待ちが35.38 goroutine秒だった。
+- initialize時にISUのID、UUID、owner、name、characterをmemory snapshotへ読み、commit済みの新規ISUだけを追記する。ISU list/detail、graph/conditionの所有権、trendのmetadataを同じsnapshotから返し、process restart後かつinitialize前だけ従来SQLへfallbackする。ownerを含めて照合し、他userのISUを公開しない。
+- B49のcondition POSTは256,290件中、202が247,192件、400が4,798件、499が4,212件だった。未完了body由来と見られる400の大半はapp responseを完了できず、Goのbody read待ちは累積約2,929 goroutine秒だった。appはbody全体を`ReadAll`してから処理するため、Nginxの`proxy_request_buffering off`を外し、不完全bodyをappへ先行転送しない。
+- 採用条件は公式validを維持した上で、trend/condition/list/detail/graphの対象SQLがほぼ消えること、trend mutex待ちとcondition所有権SQL待ちが大幅に減ること、conditionの400/499またはp95が改善すること。ownership/status/JSONの不一致、5xx、または直接指標とscoreがともに悪化した場合はE36へ戻す。

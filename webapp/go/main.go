@@ -70,11 +70,15 @@ var (
 		images map[string][]byte
 	}{images: make(map[string][]byte)}
 
-	knownIsuCache = struct {
+	isuMetadataCache = struct {
 		sync.RWMutex
-		uuids  map[string]struct{}
+		byUUID map[string]CachedIsuMetadata
+		byUser map[string][]CachedIsuMetadata
 		loaded bool
-	}{uuids: make(map[string]struct{})}
+	}{
+		byUUID: make(map[string]CachedIsuMetadata),
+		byUser: make(map[string][]CachedIsuMetadata),
+	}
 
 	conditionHistoryCache = struct {
 		sync.RWMutex
@@ -228,6 +232,14 @@ type IsuListQueryRow struct {
 	Character  string `db:"character"`
 }
 
+type CachedIsuMetadata struct {
+	ID         int    `db:"id"`
+	JIAIsuUUID string `db:"jia_isu_uuid"`
+	Name       string `db:"name"`
+	Character  string `db:"character"`
+	JIAUserID  string `db:"jia_user_id"`
+}
+
 type JIAServiceRequest struct {
 	TargetBaseURL string `json:"target_base_url"`
 	IsuUUID       string `json:"isu_uuid"`
@@ -374,34 +386,94 @@ func cacheIsuIcon(jiaUserID string, jiaIsuUUID string, image []byte) {
 }
 
 func reloadKnownIsus() error {
-	var uuids []string
-	if err := db.Select(&uuids, "SELECT `jia_isu_uuid` FROM `isu`"); err != nil {
+	var rows []CachedIsuMetadata
+	if err := db.Select(&rows,
+		"SELECT `id`, `jia_isu_uuid`, `name`, `character`, `jia_user_id` FROM `isu`"); err != nil {
 		return err
 	}
 
-	known := make(map[string]struct{}, len(uuids))
-	for _, uuid := range uuids {
-		known[uuid] = struct{}{}
+	byUUID := make(map[string]CachedIsuMetadata, len(rows))
+	byUser := make(map[string][]CachedIsuMetadata)
+	for _, metadata := range rows {
+		byUUID[metadata.JIAIsuUUID] = metadata
+		byUser[metadata.JIAUserID] = append(byUser[metadata.JIAUserID], metadata)
+	}
+	for userID := range byUser {
+		sort.Slice(byUser[userID], func(i, j int) bool {
+			return byUser[userID][i].ID > byUser[userID][j].ID
+		})
 	}
 
-	knownIsuCache.Lock()
-	knownIsuCache.uuids = known
-	knownIsuCache.loaded = true
-	knownIsuCache.Unlock()
+	isuMetadataCache.Lock()
+	isuMetadataCache.byUUID = byUUID
+	isuMetadataCache.byUser = byUser
+	isuMetadataCache.loaded = true
+	isuMetadataCache.Unlock()
 	return nil
 }
 
-func cacheKnownIsu(jiaIsuUUID string) {
-	knownIsuCache.Lock()
-	knownIsuCache.uuids[jiaIsuUUID] = struct{}{}
-	knownIsuCache.Unlock()
+func cacheIsuMetadata(metadata CachedIsuMetadata) {
+	isuMetadataCache.Lock()
+	isuMetadataCache.byUUID[metadata.JIAIsuUUID] = metadata
+	userIsus := append(isuMetadataCache.byUser[metadata.JIAUserID], metadata)
+	sort.Slice(userIsus, func(i, j int) bool { return userIsus[i].ID > userIsus[j].ID })
+	isuMetadataCache.byUser[metadata.JIAUserID] = userIsus
+	isuMetadataCache.Unlock()
+}
+
+func getCachedIsuMetadata(jiaIsuUUID string) (CachedIsuMetadata, bool, bool) {
+	isuMetadataCache.RLock()
+	metadata, ok := isuMetadataCache.byUUID[jiaIsuUUID]
+	loaded := isuMetadataCache.loaded
+	isuMetadataCache.RUnlock()
+	return metadata, ok, loaded
+}
+
+func getCachedOwnedIsuMetadata(jiaUserID, jiaIsuUUID string) (CachedIsuMetadata, bool, bool) {
+	metadata, ok, loaded := getCachedIsuMetadata(jiaIsuUUID)
+	if ok && metadata.JIAUserID != jiaUserID {
+		ok = false
+	}
+	return metadata, ok, loaded
+}
+
+func getCachedIsuList(jiaUserID string) ([]IsuListQueryRow, bool) {
+	isuMetadataCache.RLock()
+	loaded := isuMetadataCache.loaded
+	metadata := isuMetadataCache.byUser[jiaUserID]
+	rows := make([]IsuListQueryRow, len(metadata))
+	for i, isu := range metadata {
+		rows[i] = IsuListQueryRow{
+			ID: isu.ID, JIAIsuUUID: isu.JIAIsuUUID, Name: isu.Name, Character: isu.Character,
+		}
+	}
+	isuMetadataCache.RUnlock()
+	return rows, loaded
+}
+
+func snapshotIsuMetadata() ([]TrendQueryRow, []string, bool) {
+	isuMetadataCache.RLock()
+	loaded := isuMetadataCache.loaded
+	rows := make([]TrendQueryRow, 0, len(isuMetadataCache.byUUID))
+	characters := make(map[string]struct{})
+	for _, isu := range isuMetadataCache.byUUID {
+		rows = append(rows, TrendQueryRow{
+			ID: isu.ID, JIAIsuUUID: isu.JIAIsuUUID, Character: isu.Character,
+		})
+		characters[isu.Character] = struct{}{}
+	}
+	isuMetadataCache.RUnlock()
+
+	characterList := make([]string, 0, len(characters))
+	for character := range characters {
+		characterList = append(characterList, character)
+	}
+	sort.Strings(characterList)
+	return rows, characterList, loaded
 }
 
 func isKnownIsu(jiaIsuUUID string) (bool, error) {
-	knownIsuCache.RLock()
-	_, ok := knownIsuCache.uuids[jiaIsuUUID]
-	loaded := knownIsuCache.loaded
-	knownIsuCache.RUnlock()
+	_, ok, loaded := getCachedIsuMetadata(jiaIsuUUID)
 	if loaded {
 		return ok, nil
 	}
@@ -771,16 +843,19 @@ func getIsuList(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	isuList := []IsuListQueryRow{}
-	err = db.Select(
-		&isuList,
-		"SELECT i.`id`, i.`jia_isu_uuid`, i.`name`, i.`character`"+
-			" FROM `isu` i"+
-			" WHERE i.`jia_user_id` = ? ORDER BY i.`id` DESC",
-		jiaUserID)
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+	isuList, loaded := getCachedIsuList(jiaUserID)
+	if !loaded {
+		isuList = []IsuListQueryRow{}
+		err = db.Select(
+			&isuList,
+			"SELECT i.`id`, i.`jia_isu_uuid`, i.`name`, i.`character`"+
+				" FROM `isu` i"+
+				" WHERE i.`jia_user_id` = ? ORDER BY i.`id` DESC",
+			jiaUserID)
+		if err != nil {
+			c.Logger().Errorf("db error: %v", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
 	}
 
 	responseList := []GetIsuListResponse{}
@@ -949,7 +1024,10 @@ func postIsu(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	cacheKnownIsu(jiaIsuUUID)
+	cacheIsuMetadata(CachedIsuMetadata{
+		ID: isu.ID, JIAIsuUUID: isu.JIAIsuUUID, Name: isu.Name,
+		Character: isu.Character, JIAUserID: jiaUserID,
+	})
 	cacheIsuIcon(jiaUserID, jiaIsuUUID, image)
 	invalidateTrendCache()
 	return c.JSON(http.StatusCreated, isu)
@@ -971,15 +1049,26 @@ func getIsuID(c echo.Context) error {
 	jiaIsuUUID := c.Param("jia_isu_uuid")
 
 	var res Isu
-	err = db.Get(&res, "SELECT `id`, `jia_isu_uuid`, `name`, `character` FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
-		jiaUserID, jiaIsuUUID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+	metadata, found, loaded := getCachedOwnedIsuMetadata(jiaUserID, jiaIsuUUID)
+	if loaded {
+		if !found {
 			return c.String(http.StatusNotFound, "not found: isu")
 		}
+		res = Isu{
+			ID: metadata.ID, JIAIsuUUID: metadata.JIAIsuUUID,
+			Name: metadata.Name, Character: metadata.Character,
+		}
+	} else {
+		err = db.Get(&res, "SELECT `id`, `jia_isu_uuid`, `name`, `character` FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
+			jiaUserID, jiaIsuUUID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return c.String(http.StatusNotFound, "not found: isu")
+			}
 
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+			c.Logger().Errorf("db error: %v", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
 	}
 
 	return c.JSON(http.StatusOK, res)
@@ -1046,15 +1135,22 @@ func getIsuGraph(c echo.Context) error {
 	}
 	date := time.Unix(datetimeInt64, 0).Truncate(time.Hour)
 
-	var count int
-	err = db.Get(&count, "SELECT COUNT(*) FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
-		jiaUserID, jiaIsuUUID)
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-	if count == 0 {
-		return c.String(http.StatusNotFound, "not found: isu")
+	_, found, loaded := getCachedOwnedIsuMetadata(jiaUserID, jiaIsuUUID)
+	if loaded {
+		if !found {
+			return c.String(http.StatusNotFound, "not found: isu")
+		}
+	} else {
+		var count int
+		err = db.Get(&count, "SELECT COUNT(*) FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
+			jiaUserID, jiaIsuUUID)
+		if err != nil {
+			c.Logger().Errorf("db error: %v", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		if count == 0 {
+			return c.String(http.StatusNotFound, "not found: isu")
+		}
 	}
 
 	res, err := generateIsuGraphResponse(db, jiaIsuUUID, date)
@@ -1291,17 +1387,25 @@ func getIsuConditions(c echo.Context) error {
 	}
 
 	var isuName string
-	err = db.Get(&isuName,
-		"SELECT name FROM `isu` WHERE `jia_isu_uuid` = ? AND `jia_user_id` = ?",
-		jiaIsuUUID, jiaUserID,
-	)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+	metadata, found, loaded := getCachedOwnedIsuMetadata(jiaUserID, jiaIsuUUID)
+	if loaded {
+		if !found {
 			return c.String(http.StatusNotFound, "not found: isu")
 		}
+		isuName = metadata.Name
+	} else {
+		err = db.Get(&isuName,
+			"SELECT name FROM `isu` WHERE `jia_isu_uuid` = ? AND `jia_user_id` = ?",
+			jiaIsuUUID, jiaUserID,
+		)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return c.String(http.StatusNotFound, "not found: isu")
+			}
 
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+			c.Logger().Errorf("db error: %v", err)
+			return c.NoContent(http.StatusInternalServerError)
+		}
 	}
 
 	conditionsResponse, loaded, err := getIsuConditionsFromCache(jiaIsuUUID, endTime, conditionLevel, startTime, conditionLimit, isuName)
@@ -1461,17 +1565,23 @@ func calculateConditionLevel(condition string) (string, error) {
 // GET /api/trend
 // ISUの性格毎の最新のコンディション情報
 func buildTrendResponse() ([]TrendResponse, error) {
-	characterList := []Isu{}
-	err := db.Select(&characterList, "SELECT `character` FROM `isu` GROUP BY `character`")
-	if err != nil {
-		return nil, fmt.Errorf("select characters: %w", err)
-	}
+	latestConditions, characters, loaded := snapshotIsuMetadata()
+	characterList := make([]Isu, 0, len(characters))
+	if loaded {
+		for _, character := range characters {
+			characterList = append(characterList, Isu{Character: character})
+		}
+	} else {
+		characterList = []Isu{}
+		if err := db.Select(&characterList, "SELECT `character` FROM `isu` GROUP BY `character`"); err != nil {
+			return nil, fmt.Errorf("select characters: %w", err)
+		}
 
-	latestConditions := []TrendQueryRow{}
-	err = db.Select(&latestConditions,
-		"SELECT `id`, `jia_isu_uuid`, `character` FROM `isu`")
-	if err != nil {
-		return nil, fmt.Errorf("select latest conditions: %w", err)
+		latestConditions = []TrendQueryRow{}
+		if err := db.Select(&latestConditions,
+			"SELECT `id`, `jia_isu_uuid`, `character` FROM `isu`"); err != nil {
+			return nil, fmt.Errorf("select latest conditions: %w", err)
+		}
 	}
 
 	type groupedConditions struct {
