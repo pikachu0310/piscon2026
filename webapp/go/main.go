@@ -45,6 +45,7 @@ const (
 	conditionBatchWait          = 2 * time.Millisecond
 	conditionBatchMaxRequests   = 256
 	conditionBatchMaxRows       = 2000
+	conditionWriterCount        = 4
 )
 
 var (
@@ -302,7 +303,9 @@ func main() {
 	db.SetMaxOpenConns(64)
 	db.SetMaxIdleConns(64)
 	defer db.Close()
-	go runConditionWriter()
+	for i := 0; i < conditionWriterCount; i++ {
+		go runConditionWriter()
+	}
 	startDiagnosticsServer(e.Logger)
 
 	postIsuConditionTargetBaseURL = os.Getenv("POST_ISUCONDITION_TARGET_BASE_URL")
