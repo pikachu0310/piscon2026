@@ -159,10 +159,21 @@ type TrendCondition struct {
 }
 
 type TrendQueryRow struct {
-	ID        int       `db:"id"`
-	Character string    `db:"character"`
-	Timestamp time.Time `db:"timestamp"`
-	Condition string    `db:"condition"`
+	ID        int            `db:"id"`
+	Character string         `db:"character"`
+	Timestamp sql.NullTime   `db:"timestamp"`
+	Condition sql.NullString `db:"condition"`
+}
+
+type IsuListQueryRow struct {
+	ID              int            `db:"id"`
+	JIAIsuUUID      string         `db:"jia_isu_uuid"`
+	Name            string         `db:"name"`
+	Character       string         `db:"character"`
+	LatestTimestamp sql.NullTime   `db:"latest_timestamp"`
+	LatestIsSitting sql.NullBool   `db:"latest_is_sitting"`
+	LatestCondition sql.NullString `db:"latest_condition"`
+	LatestMessage   sql.NullString `db:"latest_message"`
 }
 
 type PostIsuConditionRequest struct {
@@ -329,6 +340,19 @@ func postInitialize(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
+	// 初期データからISUごとの最新コンディションを一度だけ作る。
+	// 大量アクセスされるAPIで履歴テーブルを毎回探索しないための読み取り用テーブル。
+	_, err = db.Exec(
+		"INSERT INTO `isu_condition_latest` (`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`)" +
+			" SELECT c.`jia_isu_uuid`, c.`timestamp`, c.`is_sitting`, c.`condition`, c.`message`" +
+			" FROM `isu` i JOIN `isu_condition` c ON c.`id` = (" +
+			" SELECT c2.`id` FROM `isu_condition` c2 WHERE c2.`jia_isu_uuid` = i.`jia_isu_uuid`" +
+			" ORDER BY c2.`timestamp` DESC, c2.`id` DESC LIMIT 1)")
+	if err != nil {
+		c.Logger().Errorf("db error: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+
 	_, err = db.Exec(
 		"INSERT INTO `isu_association_config` (`name`, `url`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `url` = VALUES(`url`)",
 		"jia_service_url",
@@ -461,10 +485,14 @@ func getIsuList(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	isuList := []Isu{}
+	isuList := []IsuListQueryRow{}
 	err = db.Select(
 		&isuList,
-		"SELECT `id`, `jia_isu_uuid`, `name`, `character` FROM `isu` WHERE `jia_user_id` = ? ORDER BY `id` DESC",
+		"SELECT i.`id`, i.`jia_isu_uuid`, i.`name`, i.`character`,"+
+			" l.`timestamp` AS `latest_timestamp`, l.`is_sitting` AS `latest_is_sitting`,"+
+			" l.`condition` AS `latest_condition`, l.`message` AS `latest_message`"+
+			" FROM `isu` i LEFT JOIN `isu_condition_latest` l USING (`jia_isu_uuid`)"+
+			" WHERE i.`jia_user_id` = ? ORDER BY i.`id` DESC",
 		jiaUserID)
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
@@ -473,35 +501,22 @@ func getIsuList(c echo.Context) error {
 
 	responseList := []GetIsuListResponse{}
 	for _, isu := range isuList {
-		var lastCondition IsuCondition
-		foundLastCondition := true
-		err = db.Get(&lastCondition, "SELECT `jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message` FROM `isu_condition` WHERE `jia_isu_uuid` = ? ORDER BY `timestamp` DESC LIMIT 1",
-			isu.JIAIsuUUID)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				foundLastCondition = false
-			} else {
-				c.Logger().Errorf("db error: %v", err)
-				return c.NoContent(http.StatusInternalServerError)
-			}
-		}
-
 		var formattedCondition *GetIsuConditionResponse
-		if foundLastCondition {
-			conditionLevel, err := calculateConditionLevel(lastCondition.Condition)
+		if isu.LatestTimestamp.Valid {
+			conditionLevel, err := calculateConditionLevel(isu.LatestCondition.String)
 			if err != nil {
 				c.Logger().Error(err)
 				return c.NoContent(http.StatusInternalServerError)
 			}
 
 			formattedCondition = &GetIsuConditionResponse{
-				JIAIsuUUID:     lastCondition.JIAIsuUUID,
+				JIAIsuUUID:     isu.JIAIsuUUID,
 				IsuName:        isu.Name,
-				Timestamp:      lastCondition.Timestamp.Unix(),
-				IsSitting:      lastCondition.IsSitting,
-				Condition:      lastCondition.Condition,
+				Timestamp:      isu.LatestTimestamp.Time.Unix(),
+				IsSitting:      isu.LatestIsSitting.Bool,
+				Condition:      isu.LatestCondition.String,
 				ConditionLevel: conditionLevel,
-				Message:        lastCondition.Message,
+				Message:        isu.LatestMessage.String,
 			}
 		}
 
@@ -1087,10 +1102,8 @@ func getTrend(c echo.Context) error {
 
 	latestConditions := []TrendQueryRow{}
 	err = db.Select(&latestConditions,
-		"SELECT i.`id`, i.`character`, c.`timestamp`, c.`condition` FROM `isu` i"+
-			" JOIN `isu_condition` c ON c.`id` = ("+
-			" SELECT c2.`id` FROM `isu_condition` c2 WHERE c2.`jia_isu_uuid` = i.`jia_isu_uuid`"+
-			" ORDER BY c2.`timestamp` DESC LIMIT 1)")
+		"SELECT i.`id`, i.`character`, l.`timestamp`, l.`condition` FROM `isu` i"+
+			" LEFT JOIN `isu_condition_latest` l USING (`jia_isu_uuid`)")
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
@@ -1113,12 +1126,15 @@ func getTrend(c echo.Context) error {
 		if _, ok := grouped[row.Character]; !ok {
 			grouped[row.Character] = newGroupedConditions()
 		}
-		conditionLevel, err := calculateConditionLevel(row.Condition)
+		if !row.Timestamp.Valid {
+			continue
+		}
+		conditionLevel, err := calculateConditionLevel(row.Condition.String)
 		if err != nil {
 			c.Logger().Error(err)
 			return c.NoContent(http.StatusInternalServerError)
 		}
-		trendCondition := &TrendCondition{ID: row.ID, Timestamp: row.Timestamp.Unix()}
+		trendCondition := &TrendCondition{ID: row.ID, Timestamp: row.Timestamp.Time.Unix()}
 		switch conditionLevel {
 		case conditionLevelInfo:
 			grouped[row.Character].info = append(grouped[row.Character].info, trendCondition)
@@ -1198,6 +1214,7 @@ func postIsuCondition(c echo.Context) error {
 
 	placeholders := make([]string, 0, len(req))
 	args := make([]interface{}, 0, len(req)*5)
+	latestCondition := req[0]
 	for _, cond := range req {
 		timestamp := time.Unix(cond.Timestamp, 0)
 
@@ -1206,6 +1223,9 @@ func postIsuCondition(c echo.Context) error {
 		}
 		placeholders = append(placeholders, "(?, ?, ?, ?, ?)")
 		args = append(args, jiaIsuUUID, timestamp, cond.IsSitting, cond.Condition, cond.Message)
+		if cond.Timestamp >= latestCondition.Timestamp {
+			latestCondition = cond
+		}
 	}
 
 	_, err = tx.Exec(
@@ -1213,6 +1233,20 @@ func postIsuCondition(c echo.Context) error {
 			" (`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`) VALUES "+
 			strings.Join(placeholders, ","),
 		args...)
+	if err != nil {
+		c.Logger().Errorf("db error: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+
+	_, err = tx.Exec(
+		"INSERT INTO `isu_condition_latest` (`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`)"+
+			" VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE"+
+			" `is_sitting` = IF(VALUES(`timestamp`) >= `timestamp`, VALUES(`is_sitting`), `is_sitting`),"+
+			" `condition` = IF(VALUES(`timestamp`) >= `timestamp`, VALUES(`condition`), `condition`),"+
+			" `message` = IF(VALUES(`timestamp`) >= `timestamp`, VALUES(`message`), `message`),"+
+			" `timestamp` = GREATEST(`timestamp`, VALUES(`timestamp`))",
+		jiaIsuUUID, time.Unix(latestCondition.Timestamp, 0), latestCondition.IsSitting,
+		latestCondition.Condition, latestCondition.Message)
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
