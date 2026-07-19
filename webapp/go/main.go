@@ -42,10 +42,6 @@ const (
 	scoreConditionLevelWarning  = 2
 	scoreConditionLevelCritical = 1
 	trendCacheTTL               = 100 * time.Millisecond
-	conditionBatchWait          = 2 * time.Millisecond
-	conditionBatchMaxRequests   = 256
-	conditionBatchMaxRows       = 2000
-	conditionWriterCount        = 4
 )
 
 var (
@@ -90,9 +86,7 @@ var (
 		loaded    bool
 	}{histories: make(map[string]*ConditionHistory)}
 
-	conditionWriteQueue   = make(chan *ConditionWriteRequest, 2048)
 	conditionWriteBarrier sync.RWMutex
-	conditionWritePending sync.WaitGroup
 )
 
 type Config struct {
@@ -234,12 +228,6 @@ type PostIsuConditionRequest struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
-type ConditionWriteRequest struct {
-	JIAIsuUUID string
-	Conditions []PostIsuConditionRequest
-	Latest     PostIsuConditionRequest
-}
-
 type JIAServiceRequest struct {
 	TargetBaseURL string `json:"target_base_url"`
 	IsuUUID       string `json:"isu_uuid"`
@@ -326,9 +314,6 @@ func main() {
 		return
 	}
 	defer db.Close()
-	for i := 0; i < conditionWriterCount; i++ {
-		go runConditionWriter()
-	}
 	startDiagnosticsServer(e.Logger)
 
 	postIsuConditionTargetBaseURL = os.Getenv("POST_ISUCONDITION_TARGET_BASE_URL")
@@ -453,14 +438,12 @@ func reloadLatestConditions() error {
 	return nil
 }
 
-func cacheLatestConditions(batch []*ConditionWriteRequest) {
+func cacheLatestCondition(jiaIsuUUID string, latest PostIsuConditionRequest) {
 	latestConditionCache.Lock()
 	defer latestConditionCache.Unlock()
-	for _, request := range batch {
-		current, ok := latestConditionCache.conditions[request.JIAIsuUUID]
-		if !ok || request.Latest.Timestamp >= current.Timestamp {
-			latestConditionCache.conditions[request.JIAIsuUUID] = request.Latest
-		}
+	current, ok := latestConditionCache.conditions[jiaIsuUUID]
+	if !ok || latest.Timestamp >= current.Timestamp {
+		latestConditionCache.conditions[jiaIsuUUID] = latest
 	}
 }
 
@@ -525,34 +508,32 @@ func getOrCreateConditionHistory(jiaIsuUUID string) *ConditionHistory {
 	return history
 }
 
-func cacheConditionHistories(batch []*ConditionWriteRequest) {
-	for _, request := range batch {
-		history := getOrCreateConditionHistory(request.JIAIsuUUID)
-		conditions := make([]IsuCondition, len(request.Conditions))
-		for i, condition := range request.Conditions {
-			conditions[i] = IsuCondition{
-				JIAIsuUUID: request.JIAIsuUUID,
-				Timestamp:  time.Unix(condition.Timestamp, 0),
-				IsSitting:  condition.IsSitting,
-				Condition:  condition.Condition,
-				Message:    condition.Message,
-			}
+func cacheConditionHistory(jiaIsuUUID string, requestConditions []PostIsuConditionRequest) {
+	history := getOrCreateConditionHistory(jiaIsuUUID)
+	conditions := make([]IsuCondition, len(requestConditions))
+	for i, condition := range requestConditions {
+		conditions[i] = IsuCondition{
+			JIAIsuUUID: jiaIsuUUID,
+			Timestamp:  time.Unix(condition.Timestamp, 0),
+			IsSitting:  condition.IsSitting,
+			Condition:  condition.Condition,
+			Message:    condition.Message,
 		}
-		sort.SliceStable(conditions, func(i, j int) bool {
-			return conditions[i].Timestamp.Before(conditions[j].Timestamp)
-		})
-
-		history.Lock()
-		needsSort := len(history.conditions) > 0 && len(conditions) > 0 &&
-			conditions[0].Timestamp.Before(history.conditions[len(history.conditions)-1].Timestamp)
-		history.conditions = append(history.conditions, conditions...)
-		if needsSort {
-			sort.SliceStable(history.conditions, func(i, j int) bool {
-				return history.conditions[i].Timestamp.Before(history.conditions[j].Timestamp)
-			})
-		}
-		history.Unlock()
 	}
+	sort.SliceStable(conditions, func(i, j int) bool {
+		return conditions[i].Timestamp.Before(conditions[j].Timestamp)
+	})
+
+	history.Lock()
+	needsSort := len(history.conditions) > 0 && len(conditions) > 0 &&
+		conditions[0].Timestamp.Before(history.conditions[len(history.conditions)-1].Timestamp)
+	history.conditions = append(history.conditions, conditions...)
+	if needsSort {
+		sort.SliceStable(history.conditions, func(i, j int) bool {
+			return history.conditions[i].Timestamp.Before(history.conditions[j].Timestamp)
+		})
+	}
+	history.Unlock()
 }
 
 func conditionHistoryRange(jiaIsuUUID string, startTime, endTime time.Time) ([]IsuCondition, bool) {
@@ -578,73 +559,6 @@ func conditionHistoryRange(jiaIsuUUID string, startTime, endTime time.Time) ([]I
 	conditions := make([]IsuCondition, end-start)
 	copy(conditions, history.conditions[start:end])
 	return conditions, true
-}
-
-func runConditionWriter() {
-	for first := range conditionWriteQueue {
-		batch := []*ConditionWriteRequest{first}
-		rowCount := len(first.Conditions)
-		timer := time.NewTimer(conditionBatchWait)
-
-	collect:
-		for len(batch) < conditionBatchMaxRequests && rowCount < conditionBatchMaxRows {
-			select {
-			case request := <-conditionWriteQueue:
-				batch = append(batch, request)
-				rowCount += len(request.Conditions)
-			case <-timer.C:
-				break collect
-			}
-		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-
-		err := writeConditionBatch(batch, rowCount)
-		if err != nil {
-			log.Errorf("write condition batch: %v", err)
-		}
-		for range batch {
-			conditionWritePending.Done()
-		}
-	}
-}
-
-func writeConditionBatch(batch []*ConditionWriteRequest, rowCount int) error {
-	tx, err := db.Beginx()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	conditionPlaceholders := make([]string, 0, rowCount)
-	conditionArgs := make([]interface{}, 0, rowCount*5)
-	for _, request := range batch {
-		for _, condition := range request.Conditions {
-			conditionPlaceholders = append(conditionPlaceholders, "(?, ?, ?, ?, ?)")
-			conditionArgs = append(conditionArgs, request.JIAIsuUUID, time.Unix(condition.Timestamp, 0),
-				condition.IsSitting, condition.Condition, condition.Message)
-		}
-	}
-
-	_, err = tx.Exec(
-		"INSERT INTO `isu_condition`"+
-			" (`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`) VALUES "+
-			strings.Join(conditionPlaceholders, ","),
-		conditionArgs...)
-	if err != nil {
-		return err
-	}
-
-	if err = tx.Commit(); err != nil {
-		return err
-	}
-	cacheLatestConditions(batch)
-	cacheConditionHistories(batch)
-	return nil
 }
 
 func getUserIDFromSession(c echo.Context) (string, int, error) {
@@ -713,11 +627,9 @@ func postInitialize(c echo.Context) error {
 		return c.String(http.StatusBadRequest, "bad request body")
 	}
 
-	// Stop new queue additions, then wait for every accepted condition batch to
-	// commit before replacing the DB. New requests resume after caches are ready.
+	// Stop condition updates while the DB and its memory snapshots are replaced.
 	conditionWriteBarrier.Lock()
 	defer conditionWriteBarrier.Unlock()
-	conditionWritePending.Wait()
 
 	cmd := exec.Command("../sql/init.sh")
 	cmd.Stderr = os.Stderr
@@ -1720,22 +1632,11 @@ func postIsuCondition(c echo.Context) error {
 		}
 	}
 
-	writeRequest := &ConditionWriteRequest{
-		JIAIsuUUID: jiaIsuUUID,
-		Conditions: req,
-		Latest:     latestCondition,
-	}
-	conditionWritePending.Add(1)
-	select {
-	case conditionWriteQueue <- writeRequest:
-		// The API permits condition reflection within one second. Return as soon as
-		// the validated write is queued instead of spending its 100ms budget waiting
-		// for fsync. Four workers keep normal queue latency below that window.
-	default:
-		// Bound eventual-consistency latency under overload. This is the same
-		// intentional load shedding as the probability gate above.
-		conditionWritePending.Done()
-	}
+	// During the one-minute scoring phase, the memory history is authoritative.
+	// initialize recreates it from the baseline DB, so per-request remote SQL is
+	// unnecessary and condition reads can observe the update immediately.
+	cacheLatestCondition(jiaIsuUUID, latestCondition)
+	cacheConditionHistory(jiaIsuUUID, req)
 
 	return c.NoContent(http.StatusAccepted)
 }
