@@ -2,7 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"io/ioutil"
+	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -28,5 +31,34 @@ func TestConditionJSONMatchesStandardLibrary(t *testing.T) {
 		if standardErr == nil && !reflect.DeepEqual(standard, fast) {
 			t.Fatalf("decoded value differs for %q: standard=%#v fast=%#v", body, standard, fast)
 		}
+	}
+}
+
+func TestReadConditionRequestBody(t *testing.T) {
+	tests := []struct {
+		name          string
+		body          string
+		contentLength int64
+		wantErr       bool
+	}{
+		{name: "known length", body: `[{"timestamp":1}]`, contentLength: int64(len(`[{"timestamp":1}]`))},
+		{name: "premature EOF", body: `short`, contentLength: 10, wantErr: true},
+		{name: "unknown length", body: `[{"timestamp":2}]`, contentLength: -1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &http.Request{
+				Body:          ioutil.NopCloser(strings.NewReader(tt.body)),
+				ContentLength: tt.contentLength,
+			}
+			got, err := readConditionRequestBody(r)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("error = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if !tt.wantErr && string(got) != tt.body {
+				t.Fatalf("body = %q, want %q", got, tt.body)
+			}
+		})
 	}
 }

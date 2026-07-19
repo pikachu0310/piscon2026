@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"os"
@@ -1567,6 +1568,19 @@ func getTrend(c echo.Context) error {
 	return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, body)
 }
 
+const maxConditionBodyPreallocate = 1 << 20
+
+// readConditionRequestBody avoids the growth copies performed by ReadAll for
+// the normal case where net/http has already parsed a trustworthy Content-Length.
+func readConditionRequestBody(r *http.Request) ([]byte, error) {
+	if r.ContentLength >= 0 && r.ContentLength <= maxConditionBodyPreallocate {
+		body := make([]byte, int(r.ContentLength))
+		_, err := io.ReadFull(r.Body, body)
+		return body, err
+	}
+	return ioutil.ReadAll(r.Body)
+}
+
 // POST /api/condition/:jia_isu_uuid
 // ISUからのコンディションを受け取る
 func postIsuCondition(c echo.Context) error {
@@ -1575,7 +1589,7 @@ func postIsuCondition(c echo.Context) error {
 		return c.String(http.StatusBadRequest, "missing: jia_isu_uuid")
 	}
 
-	body, err := ioutil.ReadAll(c.Request().Body)
+	body, err := readConditionRequestBody(c.Request())
 	if err != nil {
 		return c.String(http.StatusBadRequest, "bad request body")
 	}
