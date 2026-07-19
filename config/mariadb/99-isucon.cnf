@@ -1,4 +1,8 @@
 [mysqld]
+# The database runs on the private cluster network in the three-host layout.
+bind-address = 0.0.0.0
+skip-name-resolve
+
 # PISCON hosts have about 3.6 GiB of RAM. Keep the hot condition and icon data
 # in InnoDB instead of leaving the default 128 MiB buffer pool.
 innodb_buffer_pool_size = 1G
