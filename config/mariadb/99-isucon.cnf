@@ -10,3 +10,8 @@ innodb_buffer_pool_size = 1G
 # The OS may lose at most the latest second of transactions on a machine crash.
 # A clean MariaDB stop or competition-server reboot still flushes all commits.
 innodb_flush_log_at_trx_commit = 2
+
+# Concurrent multi-row condition INSERTs do not depend on consecutive IDs.
+# Interleaved allocation avoids serializing every bulk INSERT on the table's
+# AUTO_INCREMENT lock while preserving unique, increasing row IDs.
+innodb_autoinc_lock_mode = 2
