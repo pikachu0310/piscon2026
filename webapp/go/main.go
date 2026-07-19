@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
@@ -74,11 +73,6 @@ var (
 		uuids  map[string]struct{}
 		loaded bool
 	}{uuids: make(map[string]struct{})}
-
-	latestConditionCache = struct {
-		sync.RWMutex
-		conditions map[string]PostIsuConditionRequest
-	}{conditions: make(map[string]PostIsuConditionRequest)}
 
 	conditionHistoryCache = struct {
 		sync.RWMutex
@@ -213,14 +207,6 @@ type IsuListQueryRow struct {
 	Character  string `db:"character"`
 }
 
-type LatestConditionQueryRow struct {
-	JIAIsuUUID string    `db:"jia_isu_uuid"`
-	Timestamp  time.Time `db:"timestamp"`
-	IsSitting  bool      `db:"is_sitting"`
-	Condition  string    `db:"condition"`
-	Message    string    `db:"message"`
-}
-
 type PostIsuConditionRequest struct {
 	IsSitting bool   `json:"is_sitting"`
 	Condition string `json:"condition"`
@@ -309,8 +295,8 @@ func main() {
 	}
 	db.SetMaxOpenConns(64)
 	db.SetMaxIdleConns(64)
-	if err = reloadLatestConditions(); err != nil {
-		e.Logger.Fatalf("failed to load latest conditions: %v", err)
+	if err = reloadConditionHistories(); err != nil {
+		e.Logger.Fatalf("failed to load condition histories: %v", err)
 		return
 	}
 	defer db.Close()
@@ -415,44 +401,27 @@ func isKnownIsu(jiaIsuUUID string) (bool, error) {
 	return count != 0, nil
 }
 
-func reloadLatestConditions() error {
-	rows := []LatestConditionQueryRow{}
-	if err := db.Select(&rows,
-		"SELECT `jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message` FROM `isu_condition_latest`"); err != nil {
-		return err
-	}
-
-	conditions := make(map[string]PostIsuConditionRequest, len(rows))
-	for _, row := range rows {
-		conditions[row.JIAIsuUUID] = PostIsuConditionRequest{
-			Timestamp: row.Timestamp.Unix(),
-			IsSitting: row.IsSitting,
-			Condition: row.Condition,
-			Message:   row.Message,
-		}
-	}
-
-	latestConditionCache.Lock()
-	latestConditionCache.conditions = conditions
-	latestConditionCache.Unlock()
-	return nil
-}
-
-func cacheLatestCondition(jiaIsuUUID string, latest PostIsuConditionRequest) {
-	latestConditionCache.Lock()
-	defer latestConditionCache.Unlock()
-	current, ok := latestConditionCache.conditions[jiaIsuUUID]
-	if !ok || latest.Timestamp >= current.Timestamp {
-		latestConditionCache.conditions[jiaIsuUUID] = latest
-	}
-}
-
 func snapshotLatestConditions() map[string]PostIsuConditionRequest {
-	latestConditionCache.RLock()
-	defer latestConditionCache.RUnlock()
-	conditions := make(map[string]PostIsuConditionRequest, len(latestConditionCache.conditions))
-	for uuid, condition := range latestConditionCache.conditions {
-		conditions[uuid] = condition
+	conditionHistoryCache.RLock()
+	histories := make(map[string]*ConditionHistory, len(conditionHistoryCache.histories))
+	for uuid, history := range conditionHistoryCache.histories {
+		histories[uuid] = history
+	}
+	conditionHistoryCache.RUnlock()
+
+	conditions := make(map[string]PostIsuConditionRequest, len(histories))
+	for uuid, history := range histories {
+		history.RLock()
+		if len(history.conditions) != 0 {
+			latest := history.conditions[len(history.conditions)-1]
+			conditions[uuid] = PostIsuConditionRequest{
+				Timestamp: latest.Timestamp.Unix(),
+				IsSitting: latest.IsSitting,
+				Condition: latest.Condition,
+				Message:   latest.Message,
+			}
+		}
+		history.RUnlock()
 	}
 	return conditions
 }
@@ -640,22 +609,6 @@ func postInitialize(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	// 初期データからISUごとの最新コンディションを一度だけ作る。
-	// 大量アクセスされるAPIで履歴テーブルを毎回探索しないための読み取り用テーブル。
-	_, err = db.Exec(
-		"INSERT INTO `isu_condition_latest` (`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`)" +
-			" SELECT c.`jia_isu_uuid`, c.`timestamp`, c.`is_sitting`, c.`condition`, c.`message`" +
-			" FROM `isu` i JOIN `isu_condition` c ON c.`id` = (" +
-			" SELECT c2.`id` FROM `isu_condition` c2 WHERE c2.`jia_isu_uuid` = i.`jia_isu_uuid`" +
-			" ORDER BY c2.`timestamp` DESC, c2.`id` DESC LIMIT 1)")
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
-	if err = reloadLatestConditions(); err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
-	}
 	if err = reloadConditionHistories(); err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
@@ -1591,12 +1544,6 @@ func getTrend(c echo.Context) error {
 // POST /api/condition/:jia_isu_uuid
 // ISUからのコンディションを受け取る
 func postIsuCondition(c echo.Context) error {
-	// TODO: 一定割合リクエストを落としてしのぐようにしたが、本来は全量さばけるようにすべき
-	dropProbability := 0.3
-	if rand.Float64() <= dropProbability {
-		return c.NoContent(http.StatusAccepted)
-	}
-
 	jiaIsuUUID := c.Param("jia_isu_uuid")
 	if jiaIsuUUID == "" {
 		return c.String(http.StatusBadRequest, "missing: jia_isu_uuid")
@@ -1622,20 +1569,15 @@ func postIsuCondition(c echo.Context) error {
 		return c.String(http.StatusNotFound, "not found: isu")
 	}
 
-	latestCondition := req[0]
 	for _, cond := range req {
 		if !isValidConditionFormat(cond.Condition) {
 			return c.String(http.StatusBadRequest, "bad request body")
-		}
-		if cond.Timestamp >= latestCondition.Timestamp {
-			latestCondition = cond
 		}
 	}
 
 	// During the one-minute scoring phase, the memory history is authoritative.
 	// initialize recreates it from the baseline DB, so per-request remote SQL is
 	// unnecessary and condition reads can observe the update immediately.
-	cacheLatestCondition(jiaIsuUUID, latestCondition)
 	cacheConditionHistory(jiaIsuUUID, req)
 
 	return c.NoContent(http.StatusAccepted)
