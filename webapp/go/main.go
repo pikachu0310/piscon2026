@@ -42,7 +42,7 @@ const (
 	scoreConditionLevelWarning    = 2
 	scoreConditionLevelCritical   = 1
 	trendCacheTTL                 = 100 * time.Millisecond
-	conditionHistoryAppendReserve = 1024
+	conditionHistoryAppendReserve = 8192
 )
 
 var (
