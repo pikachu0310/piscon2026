@@ -841,3 +841,23 @@ slow/access/pprof/fgprof/OS計測だけを根拠に次の改善を選ぶ。
 - initialize時にISUのID、UUID、owner、name、characterをmemory snapshotへ読み、commit済みの新規ISUだけを追記する。ISU list/detail、graph/conditionの所有権、trendのmetadataを同じsnapshotから返し、process restart後かつinitialize前だけ従来SQLへfallbackする。ownerを含めて照合し、他userのISUを公開しない。
 - B49のcondition POSTは256,290件中、202が247,192件、400が4,798件、499が4,212件だった。未完了body由来と見られる400の大半はapp responseを完了できず、Goのbody read待ちは累積約2,929 goroutine秒だった。appはbody全体を`ReadAll`してから処理するため、Nginxの`proxy_request_buffering off`を外し、不完全bodyをappへ先行転送しない。
 - 採用条件は公式validを維持した上で、trend/condition/list/detail/graphの対象SQLがほぼ消えること、trend mutex待ちとcondition所有権SQL待ちが大幅に減ること、conditionの400/499またはp95が改善すること。ownership/status/JSONの不一致、5xx、または直接指標とscoreがともに悪化した場合はE36へ戻す。
+
+### E50 first result / repeat expectation
+
+- 公式benchmark `d9a6a741-cf5d-45be-bea9-99fea99516a0`は138,810点、PASSED、減点0、timeout 287。計測runは`20260719T143634.228695Z-s1-7209ff`で、全hostが`ANALYZED`、errorなしだった。
+- hot read SQLは狙いどおり消え、slow logは40,257 query・4.27秒から6,980 query・2.19秒へ減った。trendは平均7.2ms/p95 37msから2.2ms/6ms、GET conditionは5.9ms/20msから1.5ms/4ms、ISU detailは3.6ms/11msから1.0ms/2ms、listは3.5ms/7msから0.9ms/2msへ改善した。fgprof上位からtrend lockと所有権SQL待ちも消えた。
+- conditionの4xxは9,098件から5,022件、p95は84msから63ms、timeoutは450から287へ改善した。202は247,192→234,267件だが、登録成功も976→920件へ減っており、1登録あたりの202は253.3→254.6件と僅かに増えた。
+- score低下と直接指標の改善が食い違う主因は、vendor平均182→202ms、登録平均215→236ms、登録成功976→920というrun開始側の差と推測する。同一binaryを再計測し、valid scoreと登録数が回復するか、hot read/condition改善が再現するかを確認する。再測定でもscoreと登録数が明確に悪化する場合は変更を分離して評価する。
+
+### E50 repeat result
+
+- 同一binary/configの公式benchmark `482d8d2b-b8fa-41f5-8a31-e9ffce3fdf5d` は143,994点、PASSED、減点0、timeout 584。計測runは`20260719T144049.851380Z-s1-97f665`で、全hostが`ANALYZED`、全`errors.txt`は空だった。
+- slow logは7,200 query・2.37秒で、E50初回と同様にread側のhot SQLは消えた。trendは平均3ms/p95 11ms、GET conditionは平均2ms/p95 5ms、ISU detail/listはともにp95 2msで、B49からの改善を再現した。
+- conditionは253,637件中202が248,181件、4xxが5,456件、p95 68ms。登録成功913件あたりの202は約271.8件で、B49の約253.3件を上回った。メタデータcacheは直接指標を二度再現し、ownership test、race testも通っているため採用する。
+- 一方、scoreはB49比-4.8%、E50初回と合わせた2回ともB49を下回った。E50はcacheとNginx bufferingを同時に変えていたため、次はNginx設定だけを分離して測る。
+
+### E51 expectation
+
+- E50のメタデータcacheは維持し、condition locationだけ`proxy_request_buffering off`へ戻す。これによりNginxがrequest body全体を待たず、到着したchunkをGoへ先行転送する。
+- buffering onのE50 repeatはcondition 202が248,181件、4xxが5,456件、平均14ms、p95 68ms、1登録あたり202が約271.8件だった。E51では202/4xx、平均/p95、Goのbody read待ち、登録数、scoreを比較する。
+- 202 throughputまたはscoreが明確に改善すればstreamingを採用する。400/499やtail latencyだけが悪化し、score/登録あたり202も改善しなければbuffering onへ戻す。
