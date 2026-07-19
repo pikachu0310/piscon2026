@@ -262,7 +262,8 @@ func main() {
 		e.Logger.Fatalf("failed to connect db: %v", err)
 		return
 	}
-	db.SetMaxOpenConns(10)
+	db.SetMaxOpenConns(64)
+	db.SetMaxIdleConns(64)
 	defer db.Close()
 	startDiagnosticsServer(e.Logger)
 
