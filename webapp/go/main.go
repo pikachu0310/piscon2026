@@ -21,6 +21,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/labstack/gommon/log"
@@ -47,6 +48,7 @@ var (
 	db                  *sqlx.DB
 	sessionStore        sessions.Store
 	mySQLConnectionData *MySQLConnectionEnv
+	conditionJSON       = jsoniter.ConfigCompatibleWithStandardLibrary
 
 	jiaJWTSigningKey *ecdsa.PublicKey
 
@@ -1578,7 +1580,7 @@ func postIsuCondition(c echo.Context) error {
 		return c.String(http.StatusBadRequest, "bad request body")
 	}
 	req := make([]CachedCondition, 0, bytes.Count(body, []byte("{")))
-	err = json.Unmarshal(body, &req)
+	err = conditionJSON.Unmarshal(body, &req)
 	if err != nil {
 		return c.String(http.StatusBadRequest, "bad request body")
 	} else if len(req) == 0 {
