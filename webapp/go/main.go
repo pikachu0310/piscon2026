@@ -478,9 +478,6 @@ func reloadConditionHistories() error {
 }
 
 func internConditionMessage(message string) string {
-	if value, ok := conditionMessageInterner.Load(message); ok {
-		return value.(string)
-	}
 	value, _ := conditionMessageInterner.LoadOrStore(message, message)
 	return value.(string)
 }
