@@ -139,10 +139,10 @@ type ConditionHistory struct {
 }
 
 type CachedCondition struct {
-	Timestamp int64
-	Condition string
-	Message   string
-	IsSitting bool
+	Timestamp int64  `json:"timestamp"`
+	Condition string `json:"condition"`
+	Message   string `json:"message"`
+	IsSitting bool   `json:"is_sitting"`
 }
 
 type MySQLConnectionEnv struct {
@@ -224,13 +224,6 @@ type IsuListQueryRow struct {
 	JIAIsuUUID string `db:"jia_isu_uuid"`
 	Name       string `db:"name"`
 	Character  string `db:"character"`
-}
-
-type PostIsuConditionRequest struct {
-	IsSitting bool   `json:"is_sitting"`
-	Condition string `json:"condition"`
-	Message   string `json:"message"`
-	Timestamp int64  `json:"timestamp"`
 }
 
 type JIAServiceRequest struct {
@@ -420,7 +413,7 @@ func isKnownIsu(jiaIsuUUID string) (bool, error) {
 	return count != 0, nil
 }
 
-func snapshotLatestConditions() map[string]PostIsuConditionRequest {
+func snapshotLatestConditions() map[string]CachedCondition {
 	conditionHistoryCache.RLock()
 	histories := make(map[string]*ConditionHistory, len(conditionHistoryCache.histories))
 	for uuid, history := range conditionHistoryCache.histories {
@@ -428,17 +421,12 @@ func snapshotLatestConditions() map[string]PostIsuConditionRequest {
 	}
 	conditionHistoryCache.RUnlock()
 
-	conditions := make(map[string]PostIsuConditionRequest, len(histories))
+	conditions := make(map[string]CachedCondition, len(histories))
 	for uuid, history := range histories {
 		history.RLock()
 		if len(history.conditions) != 0 {
 			latest := history.conditions[len(history.conditions)-1]
-			conditions[uuid] = PostIsuConditionRequest{
-				Timestamp: latest.Timestamp,
-				IsSitting: latest.IsSitting,
-				Condition: latest.Condition,
-				Message:   latest.Message,
-			}
+			conditions[uuid] = latest
 		}
 		history.RUnlock()
 	}
@@ -510,17 +498,8 @@ func getOrCreateConditionHistory(jiaIsuUUID string) *ConditionHistory {
 	return history
 }
 
-func cacheConditionHistory(jiaIsuUUID string, requestConditions []PostIsuConditionRequest) {
+func cacheConditionHistory(jiaIsuUUID string, conditions []CachedCondition) {
 	history := getOrCreateConditionHistory(jiaIsuUUID)
-	conditions := make([]CachedCondition, len(requestConditions))
-	for i, condition := range requestConditions {
-		conditions[i] = CachedCondition{
-			Timestamp: condition.Timestamp,
-			IsSitting: condition.IsSitting,
-			Condition: condition.Condition,
-			Message:   condition.Message,
-		}
-	}
 	sort.SliceStable(conditions, func(i, j int) bool {
 		return conditions[i].Timestamp < conditions[j].Timestamp
 	})
@@ -1594,8 +1573,12 @@ func postIsuCondition(c echo.Context) error {
 		return c.String(http.StatusBadRequest, "missing: jia_isu_uuid")
 	}
 
-	req := []PostIsuConditionRequest{}
-	err := c.Bind(&req)
+	body, err := ioutil.ReadAll(c.Request().Body)
+	if err != nil {
+		return c.String(http.StatusBadRequest, "bad request body")
+	}
+	req := make([]CachedCondition, 0, bytes.Count(body, []byte("{")))
+	err = json.Unmarshal(body, &req)
 	if err != nil {
 		return c.String(http.StatusBadRequest, "bad request body")
 	} else if len(req) == 0 {
