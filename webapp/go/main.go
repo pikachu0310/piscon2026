@@ -28,20 +28,21 @@ import (
 )
 
 const (
-	sessionName                 = "isucondition_go"
-	conditionLimit              = 20
-	frontendContentsPath        = "../public"
-	jiaJWTSigningKeyPath        = "../ec256-public.pem"
-	defaultIconFilePath         = "../NoImage.jpg"
-	defaultJIAServiceURL        = "http://localhost:5000"
-	mysqlErrNumDuplicateEntry   = 1062
-	conditionLevelInfo          = "info"
-	conditionLevelWarning       = "warning"
-	conditionLevelCritical      = "critical"
-	scoreConditionLevelInfo     = 3
-	scoreConditionLevelWarning  = 2
-	scoreConditionLevelCritical = 1
-	trendCacheTTL               = 100 * time.Millisecond
+	sessionName                   = "isucondition_go"
+	conditionLimit                = 20
+	frontendContentsPath          = "../public"
+	jiaJWTSigningKeyPath          = "../ec256-public.pem"
+	defaultIconFilePath           = "../NoImage.jpg"
+	defaultJIAServiceURL          = "http://localhost:5000"
+	mysqlErrNumDuplicateEntry     = 1062
+	conditionLevelInfo            = "info"
+	conditionLevelWarning         = "warning"
+	conditionLevelCritical        = "critical"
+	scoreConditionLevelInfo       = 3
+	scoreConditionLevelWarning    = 2
+	scoreConditionLevelCritical   = 1
+	trendCacheTTL                 = 100 * time.Millisecond
+	conditionHistoryAppendReserve = 1024
 )
 
 var (
@@ -469,6 +470,11 @@ func reloadConditionHistories() error {
 	if err = rows.Err(); err != nil {
 		return err
 	}
+	for _, history := range histories {
+		reserved := make([]CachedCondition, len(history.conditions), len(history.conditions)+conditionHistoryAppendReserve)
+		copy(reserved, history.conditions)
+		history.conditions = reserved
+	}
 
 	conditionHistoryCache.Lock()
 	conditionHistoryCache.histories = histories
@@ -494,7 +500,7 @@ func getOrCreateConditionHistory(jiaIsuUUID string) *ConditionHistory {
 	defer conditionHistoryCache.Unlock()
 	history = conditionHistoryCache.histories[jiaIsuUUID]
 	if history == nil {
-		history = &ConditionHistory{}
+		history = &ConditionHistory{conditions: make([]CachedCondition, 0, conditionHistoryAppendReserve)}
 		conditionHistoryCache.histories[jiaIsuUUID] = history
 	}
 	return history
