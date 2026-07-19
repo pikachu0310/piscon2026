@@ -79,6 +79,11 @@ var (
 		loaded bool
 	}{uuids: make(map[string]struct{})}
 
+	latestConditionCache = struct {
+		sync.RWMutex
+		conditions map[string]PostIsuConditionRequest
+	}{conditions: make(map[string]PostIsuConditionRequest)}
+
 	conditionWriteQueue   = make(chan *ConditionWriteRequest, 8192)
 	conditionWriteBarrier sync.RWMutex
 )
@@ -190,21 +195,24 @@ type TrendCondition struct {
 }
 
 type TrendQueryRow struct {
-	ID        int            `db:"id"`
-	Character string         `db:"character"`
-	Timestamp sql.NullTime   `db:"timestamp"`
-	Condition sql.NullString `db:"condition"`
+	ID         int    `db:"id"`
+	JIAIsuUUID string `db:"jia_isu_uuid"`
+	Character  string `db:"character"`
 }
 
 type IsuListQueryRow struct {
-	ID              int            `db:"id"`
-	JIAIsuUUID      string         `db:"jia_isu_uuid"`
-	Name            string         `db:"name"`
-	Character       string         `db:"character"`
-	LatestTimestamp sql.NullTime   `db:"latest_timestamp"`
-	LatestIsSitting sql.NullBool   `db:"latest_is_sitting"`
-	LatestCondition sql.NullString `db:"latest_condition"`
-	LatestMessage   sql.NullString `db:"latest_message"`
+	ID         int    `db:"id"`
+	JIAIsuUUID string `db:"jia_isu_uuid"`
+	Name       string `db:"name"`
+	Character  string `db:"character"`
+}
+
+type LatestConditionQueryRow struct {
+	JIAIsuUUID string    `db:"jia_isu_uuid"`
+	Timestamp  time.Time `db:"timestamp"`
+	IsSitting  bool      `db:"is_sitting"`
+	Condition  string    `db:"condition"`
+	Message    string    `db:"message"`
 }
 
 type PostIsuConditionRequest struct {
@@ -302,6 +310,10 @@ func main() {
 	}
 	db.SetMaxOpenConns(64)
 	db.SetMaxIdleConns(64)
+	if err = reloadLatestConditions(); err != nil {
+		e.Logger.Fatalf("failed to load latest conditions: %v", err)
+		return
+	}
 	defer db.Close()
 	for i := 0; i < conditionWriterCount; i++ {
 		go runConditionWriter()
@@ -407,6 +419,50 @@ func isKnownIsu(jiaIsuUUID string) (bool, error) {
 	return count != 0, nil
 }
 
+func reloadLatestConditions() error {
+	rows := []LatestConditionQueryRow{}
+	if err := db.Select(&rows,
+		"SELECT `jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message` FROM `isu_condition_latest`"); err != nil {
+		return err
+	}
+
+	conditions := make(map[string]PostIsuConditionRequest, len(rows))
+	for _, row := range rows {
+		conditions[row.JIAIsuUUID] = PostIsuConditionRequest{
+			Timestamp: row.Timestamp.Unix(),
+			IsSitting: row.IsSitting,
+			Condition: row.Condition,
+			Message:   row.Message,
+		}
+	}
+
+	latestConditionCache.Lock()
+	latestConditionCache.conditions = conditions
+	latestConditionCache.Unlock()
+	return nil
+}
+
+func cacheLatestConditions(batch []*ConditionWriteRequest) {
+	latestConditionCache.Lock()
+	defer latestConditionCache.Unlock()
+	for _, request := range batch {
+		current, ok := latestConditionCache.conditions[request.JIAIsuUUID]
+		if !ok || request.Latest.Timestamp >= current.Timestamp {
+			latestConditionCache.conditions[request.JIAIsuUUID] = request.Latest
+		}
+	}
+}
+
+func snapshotLatestConditions() map[string]PostIsuConditionRequest {
+	latestConditionCache.RLock()
+	defer latestConditionCache.RUnlock()
+	conditions := make(map[string]PostIsuConditionRequest, len(latestConditionCache.conditions))
+	for uuid, condition := range latestConditionCache.conditions {
+		conditions[uuid] = condition
+	}
+	return conditions
+}
+
 func runConditionWriter() {
 	for first := range conditionWriteQueue {
 		batch := []*ConditionWriteRequest{first}
@@ -446,19 +502,12 @@ func writeConditionBatch(batch []*ConditionWriteRequest, rowCount int) error {
 
 	conditionPlaceholders := make([]string, 0, rowCount)
 	conditionArgs := make([]interface{}, 0, rowCount*5)
-	latestPlaceholders := make([]string, 0, len(batch))
-	latestArgs := make([]interface{}, 0, len(batch)*5)
-
 	for _, request := range batch {
 		for _, condition := range request.Conditions {
 			conditionPlaceholders = append(conditionPlaceholders, "(?, ?, ?, ?, ?)")
 			conditionArgs = append(conditionArgs, request.JIAIsuUUID, time.Unix(condition.Timestamp, 0),
 				condition.IsSitting, condition.Condition, condition.Message)
 		}
-
-		latestPlaceholders = append(latestPlaceholders, "(?, ?, ?, ?, ?)")
-		latestArgs = append(latestArgs, request.JIAIsuUUID, time.Unix(request.Latest.Timestamp, 0),
-			request.Latest.IsSitting, request.Latest.Condition, request.Latest.Message)
 	}
 
 	_, err = tx.Exec(
@@ -470,20 +519,11 @@ func writeConditionBatch(batch []*ConditionWriteRequest, rowCount int) error {
 		return err
 	}
 
-	_, err = tx.Exec(
-		"INSERT INTO `isu_condition_latest` (`jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`) VALUES "+
-			strings.Join(latestPlaceholders, ",")+
-			" ON DUPLICATE KEY UPDATE"+
-			" `is_sitting` = IF(VALUES(`timestamp`) >= `timestamp`, VALUES(`is_sitting`), `is_sitting`),"+
-			" `condition` = IF(VALUES(`timestamp`) >= `timestamp`, VALUES(`condition`), `condition`),"+
-			" `message` = IF(VALUES(`timestamp`) >= `timestamp`, VALUES(`message`), `message`),"+
-			" `timestamp` = GREATEST(`timestamp`, VALUES(`timestamp`))",
-		latestArgs...)
-	if err != nil {
+	if err = tx.Commit(); err != nil {
 		return err
 	}
-
-	return tx.Commit()
+	cacheLatestConditions(batch)
+	return nil
 }
 
 func getUserIDFromSession(c echo.Context) (string, int, error) {
@@ -575,6 +615,10 @@ func postInitialize(c echo.Context) error {
 			" SELECT c2.`id` FROM `isu_condition` c2 WHERE c2.`jia_isu_uuid` = i.`jia_isu_uuid`" +
 			" ORDER BY c2.`timestamp` DESC, c2.`id` DESC LIMIT 1)")
 	if err != nil {
+		c.Logger().Errorf("db error: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	if err = reloadLatestConditions(); err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
@@ -724,10 +768,8 @@ func getIsuList(c echo.Context) error {
 	isuList := []IsuListQueryRow{}
 	err = db.Select(
 		&isuList,
-		"SELECT i.`id`, i.`jia_isu_uuid`, i.`name`, i.`character`,"+
-			" l.`timestamp` AS `latest_timestamp`, l.`is_sitting` AS `latest_is_sitting`,"+
-			" l.`condition` AS `latest_condition`, l.`message` AS `latest_message`"+
-			" FROM `isu` i LEFT JOIN `isu_condition_latest` l USING (`jia_isu_uuid`)"+
+		"SELECT i.`id`, i.`jia_isu_uuid`, i.`name`, i.`character`"+
+			" FROM `isu` i"+
 			" WHERE i.`jia_user_id` = ? ORDER BY i.`id` DESC",
 		jiaUserID)
 	if err != nil {
@@ -736,10 +778,12 @@ func getIsuList(c echo.Context) error {
 	}
 
 	responseList := []GetIsuListResponse{}
+	latestConditions := snapshotLatestConditions()
 	for _, isu := range isuList {
 		var formattedCondition *GetIsuConditionResponse
-		if isu.LatestTimestamp.Valid {
-			conditionLevel, err := calculateConditionLevel(isu.LatestCondition.String)
+		latestCondition, ok := latestConditions[isu.JIAIsuUUID]
+		if ok {
+			conditionLevel, err := calculateConditionLevel(latestCondition.Condition)
 			if err != nil {
 				c.Logger().Error(err)
 				return c.NoContent(http.StatusInternalServerError)
@@ -748,11 +792,11 @@ func getIsuList(c echo.Context) error {
 			formattedCondition = &GetIsuConditionResponse{
 				JIAIsuUUID:     isu.JIAIsuUUID,
 				IsuName:        isu.Name,
-				Timestamp:      isu.LatestTimestamp.Time.Unix(),
-				IsSitting:      isu.LatestIsSitting.Bool,
-				Condition:      isu.LatestCondition.String,
+				Timestamp:      latestCondition.Timestamp,
+				IsSitting:      latestCondition.IsSitting,
+				Condition:      latestCondition.Condition,
 				ConditionLevel: conditionLevel,
-				Message:        isu.LatestMessage.String,
+				Message:        latestCondition.Message,
 			}
 		}
 
@@ -1347,8 +1391,7 @@ func buildTrendResponse() ([]TrendResponse, error) {
 
 	latestConditions := []TrendQueryRow{}
 	err = db.Select(&latestConditions,
-		"SELECT i.`id`, i.`character`, l.`timestamp`, l.`condition` FROM `isu` i"+
-			" LEFT JOIN `isu_condition_latest` l USING (`jia_isu_uuid`)")
+		"SELECT `id`, `jia_isu_uuid`, `character` FROM `isu`")
 	if err != nil {
 		return nil, fmt.Errorf("select latest conditions: %w", err)
 	}
@@ -1366,18 +1409,20 @@ func buildTrendResponse() ([]TrendResponse, error) {
 		}
 	}
 	grouped := map[string]*groupedConditions{}
+	latestByUUID := snapshotLatestConditions()
 	for _, row := range latestConditions {
 		if _, ok := grouped[row.Character]; !ok {
 			grouped[row.Character] = newGroupedConditions()
 		}
-		if !row.Timestamp.Valid {
+		latestCondition, ok := latestByUUID[row.JIAIsuUUID]
+		if !ok {
 			continue
 		}
-		conditionLevel, err := calculateConditionLevel(row.Condition.String)
+		conditionLevel, err := calculateConditionLevel(latestCondition.Condition)
 		if err != nil {
 			return nil, err
 		}
-		trendCondition := &TrendCondition{ID: row.ID, Timestamp: row.Timestamp.Time.Unix()}
+		trendCondition := &TrendCondition{ID: row.ID, Timestamp: latestCondition.Timestamp}
 		switch conditionLevel {
 		case conditionLevelInfo:
 			grouped[row.Character].info = append(grouped[row.Character].info, trendCondition)
