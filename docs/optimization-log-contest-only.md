@@ -326,6 +326,29 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   turning it into downstream reads. Restore 2:1 for the next isolated code
   family. Keep the exact B13 3:1 backup as the scalar-score rollback target.
 
+### B19 decision: lower score, but cheaper decoding admitted more work
+
+- The condition decoder now fills the compact forwarding representation
+  directly instead of first building the larger request model and converting
+  it. The 2:1 routing base was otherwise unchanged.
+- Score fell from B16's 155,390 to 149,153, but successful condition writes
+  rose 246,147 -> **249,242** and the four tracked successful request families
+  rose 296,826 -> **298,779** (+0.66%). Registration success also rose 947 ->
+  960.
+- At the same time, total sampled App CPU fell 54.67 -> **52.61 seconds**
+  (-3.8%). Approximate CPU per tracked successful request therefore improved
+  from 0.184 ms to 0.176 ms (-4.4%). This is retained as a unit-cost frontier,
+  despite the scalar-score regression.
+- The newly available capacity was consumed by more offered condition work:
+  attempts rose 250,185 -> 254,426, condition 499 rose 111 -> 1,049 and p99
+  condition latency rose 172 -> 212 ms. Read mix also moved: trend reads fell
+  183 and condition reads fell 972. Those shifts explain why cheaper decoding
+  did not immediately convert into score.
+- This run is the concrete warning against score-only rollback. Preserve the
+  direct decoder and next reduce measurement/GC overhead or feed the released
+  capacity into useful reads; do not undo it merely because one official run
+  scored 4.0% lower.
+
 ## Four current-system maps
 
 ### Traffic
@@ -422,3 +445,12 @@ if their first official score is flat or lower.
   score and preserving valid work.
 - The registry family is promoted. Convert it with the 3:1 champion ratio next;
   then profile the new system instead of continuing to tune removed SQL calls.
+
+### 21:27 JST
+
+- B19 demonstrates the multi-axis rule under live load. Direct compact decoding
+  reduced total App CPU 3.8% while increasing tracked successful work 0.66%,
+  even though score fell to 149,153 as condition overload and read mix moved.
+- Keep the decoder as a unit-cost frontier. The next experiments target costs
+  visible in the new profile, with an exact repeat whenever offered-load
+  variance could otherwise dominate the conclusion.

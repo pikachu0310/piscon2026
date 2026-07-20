@@ -206,6 +206,21 @@ work to move saturation downstream.
 - Decision: 2:1 becomes the stable base for the next code family. Preserve B13
   as exact score rollback and B17 as the higher-arrival 3:1 registry point.
 
+### B19: direct compact condition decoder (`4471293`)
+
+- Score: 149,153, PASSED, deduction 0
+- Accepted work: 249,242 condition 202, 960 registration 201, 26,163 trend 200
+  and 22,414 condition-read 200
+- Offered load: 254,426 condition attempts versus 250,185 in B16; condition
+  499 rose 111 -> 1,049 and p99 condition latency rose 172 -> 212 ms
+- Unit cost: tracked successful work rose 296,826 -> 298,779 (+0.66%) while
+  total App CPU fell 54.67 -> 52.61 seconds (-3.8%); approximate CPU per
+  tracked success improved 4.4%
+- Decision: retain as the decoder/unit-cost frontier even though scalar score
+  fell 4.0%. The benchmark spent released capacity on additional condition
+  attempts while the score-producing read mix fell, so score alone would give
+  the wrong rollback decision.
+
 ## Decision rule
 
 Every run is judged on five axes:
