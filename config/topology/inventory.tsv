@@ -1,4 +1,4 @@
 # name<TAB>ssh_target<TAB>private_ip<TAB>roles<TAB>app_binary<TAB>go_binary<TAB>pprof_url<TAB>fgprof_url<TAB>git_root<TAB>app_service
 s1	isucon@54.65.31.134	10.0.0.26	nginx	/home/isucon/webapp/go/isucondition	/home/isucon/local/go/bin/go	http://127.0.0.1:6060/debug/pprof/profile	http://127.0.0.1:6060/debug/fgprof	-	isucondition.go
-s2	isucon@54.250.238.3	10.0.0.143	mysql	/home/isucon/webapp/go/isucondition	/home/isucon/local/go/bin/go	http://127.0.0.1:6060/debug/pprof/profile	http://127.0.0.1:6060/debug/fgprof	-	isucondition.go
+s2	isucon@54.250.238.3	10.0.0.143	app,mysql	/home/isucon/webapp/go/isucondition	/home/isucon/local/go/bin/go	http://127.0.0.1:6060/debug/pprof/profile	http://127.0.0.1:6060/debug/fgprof	-	isucondition.go
 s3	isucon@54.199.121.152	10.0.0.113	app	/home/isucon/webapp/go/isucondition	/home/isucon/local/go/bin/go	http://127.0.0.1:6060/debug/pprof/profile	http://127.0.0.1:6060/debug/fgprof	-	isucondition.go

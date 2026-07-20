@@ -55,6 +55,9 @@ var (
 	jiaJWTSigningKey *ecdsa.PublicKey
 
 	postIsuConditionTargetBaseURL string // JIAへのactivate時に登録する，ISUがconditionを送る先のURL
+	registrationOnly              bool
+	registrationGateURL           string
+	registrationGateToken         string
 
 	sessionCache = struct {
 		sync.RWMutex
@@ -73,6 +76,9 @@ var (
 	}{uuids: make(map[string]struct{})}
 
 	isuRegistrationLocks sync.Map
+	knownIsuLookupLocks  [64]sync.Mutex
+
+	registrationRequests = newRegistrationRequestGate()
 
 	conditionState atomic.Value // *ConditionState; swapped as one initialize generation
 
@@ -171,6 +177,53 @@ type CachedCondition struct {
 	Timestamp int64
 	MessageID uint32
 	Flags     uint8
+}
+
+type registrationRequestGate struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	closed bool
+	active int
+}
+
+func newRegistrationRequestGate() *registrationRequestGate {
+	gate := &registrationRequestGate{}
+	gate.cond = sync.NewCond(&gate.mu)
+	return gate
+}
+
+func (gate *registrationRequestGate) enter() {
+	gate.mu.Lock()
+	for gate.closed {
+		gate.cond.Wait()
+	}
+	gate.active++
+	gate.mu.Unlock()
+}
+
+func (gate *registrationRequestGate) leave() {
+	gate.mu.Lock()
+	gate.active--
+	if gate.active == 0 {
+		gate.cond.Broadcast()
+	}
+	gate.mu.Unlock()
+}
+
+func (gate *registrationRequestGate) closeAndDrain() {
+	gate.mu.Lock()
+	gate.closed = true
+	for gate.active != 0 {
+		gate.cond.Wait()
+	}
+	gate.mu.Unlock()
+}
+
+func (gate *registrationRequestGate) open() {
+	gate.mu.Lock()
+	gate.closed = false
+	gate.cond.Broadcast()
+	gate.mu.Unlock()
 }
 
 type IncomingCondition struct {
@@ -303,6 +356,10 @@ func init() {
 }
 
 func main() {
+	registrationOnly = getEnv("REGISTRATION_ONLY", "") == "1"
+	registrationGateURL = os.Getenv("REGISTRATION_GATE_URL")
+	registrationGateToken = os.Getenv("REGISTRATION_GATE_TOKEN")
+
 	e := echo.New()
 	e.Debug = false
 	e.Logger.SetLevel(log.INFO)
@@ -324,6 +381,8 @@ func main() {
 	e.GET("/api/trend", getTrend)
 
 	e.POST("/api/condition/:jia_isu_uuid", postIsuCondition)
+	e.POST("/internal/registration-gate/close", postRegistrationGateClose)
+	e.POST("/internal/registration-gate/open", postRegistrationGateOpen)
 
 	e.GET("/", getIndex)
 	e.GET("/isu/:jia_isu_uuid", getIndex)
@@ -340,11 +399,19 @@ func main() {
 		e.Logger.Fatalf("failed to connect db: %v", err)
 		return
 	}
-	db.SetMaxOpenConns(64)
-	db.SetMaxIdleConns(64)
-	if err = reloadConditionHistories(); err != nil {
-		e.Logger.Fatalf("failed to load condition histories: %v", err)
-		return
+	maxDBConnections := 64
+	if registrationOnly {
+		maxDBConnections = 24
+	}
+	db.SetMaxOpenConns(maxDBConnections)
+	db.SetMaxIdleConns(maxDBConnections)
+	if registrationOnly {
+		conditionState.Store(newConditionState())
+	} else {
+		if err = reloadConditionHistories(); err != nil {
+			e.Logger.Fatalf("failed to load condition histories: %v", err)
+			return
+		}
 	}
 	defer db.Close()
 	startDiagnosticsServer(e.Logger)
@@ -434,22 +501,48 @@ func cacheKnownIsu(jiaIsuUUID string) {
 	knownIsuCache.Unlock()
 }
 
+func knownIsuLookupLock(jiaIsuUUID string) *sync.Mutex {
+	const offset32 = uint32(2166136261)
+	const prime32 = uint32(16777619)
+	hash := offset32
+	for index := 0; index < len(jiaIsuUUID); index++ {
+		hash ^= uint32(jiaIsuUUID[index])
+		hash *= prime32
+	}
+	return &knownIsuLookupLocks[hash%uint32(len(knownIsuLookupLocks))]
+}
+
 func isKnownIsu(jiaIsuUUID string) (bool, error) {
 	knownIsuCache.RLock()
 	_, ok := knownIsuCache.uuids[jiaIsuUUID]
-	loaded := knownIsuCache.loaded
 	knownIsuCache.RUnlock()
-	if loaded {
-		return ok, nil
+	if ok {
+		return true, nil
 	}
 
-	// Before the first initialize after a process restart, preserve the original
-	// behavior by consulting the database instead of trusting an empty cache.
+	// Registrations may be handled by another process. Serialize misses in a
+	// bounded set of stripes, then recheck before consulting the shared DB.
+	lookupLock := knownIsuLookupLock(jiaIsuUUID)
+	lookupLock.Lock()
+	defer lookupLock.Unlock()
+	knownIsuCache.RLock()
+	_, ok = knownIsuCache.uuids[jiaIsuUUID]
+	knownIsuCache.RUnlock()
+	if ok {
+		return true, nil
+	}
+
 	var count int
 	if err := db.Get(&count, "SELECT COUNT(*) FROM `isu` WHERE `jia_isu_uuid` = ?", jiaIsuUUID); err != nil {
 		return false, err
 	}
-	return count != 0, nil
+	if count == 0 {
+		// Do not cache misses: JIA starts sending conditions before the
+		// registration transaction is committed, so a retry must recheck.
+		return false, nil
+	}
+	cacheKnownIsu(jiaIsuUUID)
+	return true, nil
 }
 
 func newConditionState() *ConditionState {
@@ -643,7 +736,7 @@ func conditionHistoryRange(state *ConditionState, jiaIsuUUID string, startTime, 
 
 func getUserIDFromSession(c echo.Context) (string, int, error) {
 	cookie, cookieErr := c.Request().Cookie(sessionName)
-	if cookieErr == nil {
+	if !registrationOnly && cookieErr == nil {
 		sessionCache.RLock()
 		jiaUserID, ok := sessionCache.users[cookie.Value]
 		sessionCache.RUnlock()
@@ -677,13 +770,50 @@ func getUserIDFromSession(c echo.Context) (string, int, error) {
 		return "", http.StatusUnauthorized, fmt.Errorf("not found: user")
 	}
 
-	if cookieErr == nil {
+	if !registrationOnly && cookieErr == nil {
 		sessionCache.Lock()
 		sessionCache.users[cookie.Value] = jiaUserID
 		sessionCache.Unlock()
 	}
 
 	return jiaUserID, 0, nil
+}
+
+func postRegistrationGateClose(c echo.Context) error {
+	if !registrationOnly || registrationGateToken == "" || c.Request().Header.Get("X-Registration-Gate-Token") != registrationGateToken {
+		return c.NoContent(http.StatusNotFound)
+	}
+	registrationRequests.closeAndDrain()
+	return c.NoContent(http.StatusNoContent)
+}
+
+func postRegistrationGateOpen(c echo.Context) error {
+	if !registrationOnly || registrationGateToken == "" || c.Request().Header.Get("X-Registration-Gate-Token") != registrationGateToken {
+		return c.NoContent(http.StatusNotFound)
+	}
+	registrationRequests.open()
+	return c.NoContent(http.StatusNoContent)
+}
+
+func setRemoteRegistrationGate(action string) error {
+	if registrationGateURL == "" {
+		return nil
+	}
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(registrationGateURL, "/")+"/"+action, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Registration-Gate-Token", registrationGateToken)
+	client := &http.Client{Timeout: 15 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("registration gate %s returned %s", action, res.Status)
+	}
+	return nil
 }
 
 func getJIAServiceURL(tx *sqlx.Tx) string {
@@ -705,6 +835,17 @@ func postInitialize(c echo.Context) error {
 	err := c.Bind(&request)
 	if err != nil {
 		return c.String(http.StatusBadRequest, "bad request body")
+	}
+	if err = setRemoteRegistrationGate("close"); err != nil {
+		c.Logger().Errorf("failed to close registration gate: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	if registrationGateURL != "" {
+		defer func() {
+			if openErr := setRemoteRegistrationGate("open"); openErr != nil {
+				c.Logger().Errorf("failed to open registration gate: %v", openErr)
+			}
+		}()
 	}
 
 	// Stop condition updates while the DB and its memory snapshots are replaced.
@@ -912,6 +1053,11 @@ func getIsuList(c echo.Context) error {
 // POST /api/isu
 // ISUを登録
 func postIsu(c echo.Context) error {
+	if registrationOnly {
+		registrationRequests.enter()
+		defer registrationRequests.leave()
+	}
+
 	jiaUserID, errStatusCode, err := getUserIDFromSession(c)
 	if err != nil {
 		if errStatusCode == http.StatusUnauthorized {
@@ -1045,9 +1191,11 @@ func postIsu(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	cacheKnownIsu(jiaIsuUUID)
-	cacheIsuIcon(jiaUserID, jiaIsuUUID, image)
-	invalidateTrendCache()
+	if !registrationOnly {
+		cacheKnownIsu(jiaIsuUUID)
+		cacheIsuIcon(jiaUserID, jiaIsuUUID, image)
+		invalidateTrendCache()
+	}
 	return c.JSON(http.StatusCreated, isu)
 }
 

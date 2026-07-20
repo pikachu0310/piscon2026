@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -131,5 +132,48 @@ func TestConditionStateGenerationKeepsMessagesTogether(t *testing.T) {
 	}
 	if got := conditionMessage(newState, oldCondition.MessageID); got != "new generation" {
 		t.Fatalf("new state resolved %q", got)
+	}
+}
+
+func TestRegistrationRequestGateDrainsAndReopens(t *testing.T) {
+	gate := newRegistrationRequestGate()
+	gate.enter()
+
+	drained := make(chan struct{})
+	go func() {
+		gate.closeAndDrain()
+		close(drained)
+	}()
+
+	select {
+	case <-drained:
+		t.Fatal("gate drained while a request was active")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	gate.leave()
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("gate did not finish draining")
+	}
+
+	entered := make(chan struct{})
+	go func() {
+		gate.enter()
+		close(entered)
+		gate.leave()
+	}()
+	select {
+	case <-entered:
+		t.Fatal("closed gate accepted a new request")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	gate.open()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("opened gate did not accept a new request")
 	}
 }
