@@ -47,6 +47,7 @@ const (
 	trendCacheTTL               = 100 * time.Millisecond
 	conditionFlagSitting        = uint8(1 << 3)
 	conditionRequestBufferSize  = 2048
+	conditionForwardBatchLimit  = 64
 )
 
 var (
@@ -123,6 +124,9 @@ var (
 	conditionWriteBarrier sync.RWMutex
 	conditionRequestPool  = sync.Pool{New: func() interface{} {
 		return new(conditionRequestBuffer)
+	}}
+	conditionForwardRequestPool = sync.Pool{New: func() interface{} {
+		return &conditionForwardRequest{result: make(chan int, 1)}
 	}}
 )
 
@@ -208,6 +212,19 @@ type conditionForwardRequest struct {
 	jiaIsuUUID string
 	conditions []ForwardedCondition
 	result     chan int
+}
+
+func acquireConditionForwardRequest(jiaIsuUUID string, conditions []ForwardedCondition) *conditionForwardRequest {
+	request := conditionForwardRequestPool.Get().(*conditionForwardRequest)
+	request.jiaIsuUUID = jiaIsuUUID
+	request.conditions = conditions
+	return request
+}
+
+func releaseConditionForwardRequest(request *conditionForwardRequest) {
+	request.jiaIsuUUID = ""
+	request.conditions = nil
+	conditionForwardRequestPool.Put(request)
 }
 
 func newRegistrationRequestGate() *registrationRequestGate {
@@ -1233,18 +1250,25 @@ func encodeForwardedConditionStatuses(statuses []int) ([]byte, error) {
 }
 
 func decodeForwardedConditionStatuses(body []byte, expected int) ([]int, error) {
+	statuses := make([]int, expected)
+	if err := decodeForwardedConditionStatusesInto(body, statuses); err != nil {
+		return nil, err
+	}
+	return statuses, nil
+}
+
+func decodeForwardedConditionStatusesInto(body []byte, statuses []int) error {
 	if len(body) < 6 || string(body[:4]) != "ICR1" {
-		return nil, fmt.Errorf("invalid forwarded status response")
+		return fmt.Errorf("invalid forwarded status response")
 	}
 	count := int(binary.LittleEndian.Uint16(body[4:]))
-	if count != expected || len(body) != 6+2*count {
-		return nil, fmt.Errorf("unexpected forwarded status count")
+	if count != len(statuses) || len(body) != 6+2*count {
+		return fmt.Errorf("unexpected forwarded status count")
 	}
-	statuses := make([]int, count)
 	for index := range statuses {
 		statuses[index] = int(binary.LittleEndian.Uint16(body[6+2*index:]))
 	}
-	return statuses, nil
+	return nil
 }
 
 func applyForwardedConditions(jiaIsuUUID string, conditions []ForwardedCondition) (int, error) {
@@ -1345,7 +1369,7 @@ func startConditionForwarders(workerCount int) {
 
 func conditionForwardWorker() {
 	for first := range conditionForwardQueue {
-		requests := make([]*conditionForwardRequest, 1, 64)
+		requests := make([]*conditionForwardRequest, 1, conditionForwardBatchLimit)
 		requests[0] = first
 	collect:
 		for len(requests) < cap(requests) {
@@ -1386,28 +1410,33 @@ func forwardConditionBatch(requests []*conditionForwardRequest) []int {
 	if res.StatusCode != http.StatusOK {
 		return statuses
 	}
-	responseBody, err := ioutil.ReadAll(res.Body)
-	if err != nil {
+	expectedResponseSize := 6 + 2*len(requests)
+	if res.ContentLength >= 0 && res.ContentLength != int64(expectedResponseSize) {
 		return statuses
 	}
-	decoded, err := decodeForwardedConditionStatuses(responseBody, len(requests))
-	if err != nil {
+	var responseBuffer [6 + 2*conditionForwardBatchLimit + 1]byte
+	responseBody := responseBuffer[:expectedResponseSize]
+	if _, err = io.ReadFull(res.Body, responseBody); err != nil {
 		return statuses
 	}
-	return decoded
+	if count, readErr := res.Body.Read(responseBuffer[expectedResponseSize : expectedResponseSize+1]); count != 0 || readErr != io.EOF {
+		return statuses
+	}
+	if err = decodeForwardedConditionStatusesInto(responseBody, statuses); err != nil {
+		return statuses
+	}
+	return statuses
 }
 
 func postIsuConditionForward(c echo.Context, jiaIsuUUID string, conditions []ForwardedCondition) error {
 	if conditionForwardQueue == nil {
 		return c.NoContent(http.StatusInternalServerError)
 	}
-	request := &conditionForwardRequest{
-		jiaIsuUUID: jiaIsuUUID,
-		conditions: conditions,
-		result:     make(chan int, 1),
-	}
+	request := acquireConditionForwardRequest(jiaIsuUUID, conditions)
 	conditionForwardQueue <- request
-	return conditionStatusResponse(c, <-request.result)
+	status := <-request.result
+	releaseConditionForwardRequest(request)
+	return conditionStatusResponse(c, status)
 }
 
 func getJIAServiceURL(tx *sqlx.Tx) string {

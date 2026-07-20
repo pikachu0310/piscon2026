@@ -534,3 +534,34 @@ func BenchmarkForwardBatchEncoderDirect(b *testing.B) {
 		}
 	}
 }
+
+var benchmarkForwardStatusBody = func() []byte {
+	statuses := make([]int, conditionForwardBatchLimit)
+	for index := range statuses {
+		statuses[index] = http.StatusAccepted
+	}
+	body, err := encodeForwardedConditionStatuses(statuses)
+	if err != nil {
+		panic(err)
+	}
+	return body
+}()
+
+func BenchmarkForwardStatusDecoderAllocating(b *testing.B) {
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		if _, err := decodeForwardedConditionStatuses(benchmarkForwardStatusBody, conditionForwardBatchLimit); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkForwardStatusDecoderInto(b *testing.B) {
+	statuses := make([]int, conditionForwardBatchLimit)
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		if err := decodeForwardedConditionStatusesInto(benchmarkForwardStatusBody, statuses); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
