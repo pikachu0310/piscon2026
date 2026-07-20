@@ -894,3 +894,10 @@ slow/access/pprof/fgprof/OS計測だけを根拠に次の改善を選ぶ。
 - E50ではISUメタデータcacheとcondition request buffering onを同時に入れた。E51はcacheありのままstreamingへ戻したため、比較できたのはbufferingの差だけで、cache自体の公式scoreへの影響は分離できていない。
 - B49のcacheなし＋streamingは151,247点、E51のcacheあり＋streamingは138,586点だった。read SQL、latency、fgprofはcacheで改善した一方、App/DBには元々余力があり、2回のE50も138,810点・143,994点に留まった。局所的なread改善が得点制約でない可能性が高い。
 - E53ではappだけをB49と同じknown-UUID cache＋read SQLへ戻し、Nginxのrequest buffering onは維持する。これによりbuffering単体を評価する。公式valid、登録成功、condition 202/4xx、1登録あたり202、body read待ち、read SQL、scoreを比較し、B49を上回るかbufferingの直接指標を維持すれば採用する。scoreとcondition throughputが悪ければB49のstreamingへ戻す。
+
+### E53 result / rollback
+
+- 公式benchmark `16c977cd-0e58-4786-8375-40277248d85e`は127,774点、PASSED、減点4、timeout 465。計測runは`20260720T043120.826913Z-s1-bd6777`で、全hostが`ANALYZED`、全`errors.txt`は空だった。
+- conditionは246,974件中202が241,164件、4xxが5,810件、平均13ms、p95 69ms。B49の202 247,192件、4xx 9,098件、p95 84msよりtail/errorは改善したが、登録成功は866件、1登録あたり202は約278.5件で、run全体の負荷生成量とscoreは大きく低下した。
+- slow logは35,870 query・5秒でread SQLが戻ったが、DBは平均83.9% idle、Appも59.9% idleで飽和していない。read SQL/cacheの有無より、100ms timeoutのcondition bodyをNginxが全量待つことが得点機会を制限したと判断する。
+- POST ISUの500 4件は、s3 journalで同時刻に4件のMariaDB error 1213 deadlockとして確認した。これはbufferingとは別の既存問題として分離する。E53を棄却し、メタデータcacheなしを維持したままconditionだけ`proxy_request_buffering off`へ戻す。
