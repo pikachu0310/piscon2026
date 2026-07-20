@@ -33,6 +33,7 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 | B11 | 20:20 | `3f0fc62` | Keep B10 routing and batch up to 64 already-queued compact condition updates behind eight edge workers | B10 spent 52.98 edge CPU-seconds while synchronously forwarding each accepted body and returned about 118k condition 499s | portal `cf2f1369-52fb-43a3-9965-26b1fcc7cf24`; artifact `20260720T112047.518093Z-s1-cc4808` | **156,224**, PASSED, deduction 0 | New overall capacity/correctness champion: near-score-champion result while accepting 2.41x B9 condition writes at much lower CPU cost |
 | B12 | 20:34 | `eeafca4` intent, B11 effective | Intended 3:1 split of condition ingress across s2 and s3 | Validate deployment from captured `upstream_addr`, not only repository diff and `nginx -t` | portal `dd5e2228-86d9-496a-afa1-6416f3bce7ed`; artifact `20260720T113448.928674Z-s1-0e9c09` | **151,449**, PASSED, deduction 0 | Valid B11 repeat and new condition-ingest count frontier; not a split experiment because all 261,883 condition attempts still reached s2 |
 | B13 | 20:42 | `eeafca4` effective | Send condition POSTs 3:1 to the batched s2 edge and directly to authoritative s3 | B11/B12 left edge CPU above authoritative CPU; every route still updates the sole s3 generation | portal `04b6a6bd-0294-474c-9424-37a5c0603e9a`; artifact `20260720T114250.931832Z-s1-c1eddf` | **162,980**, PASSED, deduction 0 | New scalar, condition-ingest, and balanced-capacity champion; test 2:1 to close the remaining CPU gap |
+| B14 | 20:49 | `aa78bde` | Change condition ingress from 3:1 to 2:1 edge:direct | B13 App CPU samples were 36.31s on s2 and 29.26s on s3 | portal `fd30ddd0-6e24-4eb7-8187-44779e45b15c`; artifact `20260720T114923.209743Z-s1-f2e80d` | **144,824**, PASSED, deduction 0 | CPU-balance and low-overload frontier, not an automatic regression; offered condition load was 11.6% lower, so repeat exactly |
 
 ### B0 facts
 
@@ -243,12 +244,28 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   the next bounded experiment because it should bring the two App CPU samples
   close to equal.
 
+### B14 decision: score fell while balance and admission quality improved
+
+- The measured routing was 170,108 attempts through s2 and 85,062 directly to
+  s3, exactly 2:1. App CPU samples converged from B13's 36.31:29.26 seconds to
+  30.69:28.71 seconds, and total App CPU fell 9.4%.
+- Score fell to 144,824 and condition 202 fell to 250,251. This is not enough
+  evidence to reject the ratio: total condition attempts also fell 288,825 ->
+  255,170 (-11.6%), while the successful share increased from 96.9% to 98.1%.
+- Condition 499 fell 5,641 -> **516**, registration success rose 900 -> 948,
+  and registration had only four 499s. B14 is the cleanest overload/correctness
+  result so far, even though the particular offered-load trajectory produced a
+  lower scalar score.
+- Total App CPU per accepted condition was approximately flat versus B13
+  (0.237 ms versus 0.234 ms). Repeat the exact 2:1 configuration in B15 to
+  distinguish ratio behavior from benchmark demand variance.
+
 ## Four current-system maps
 
 ### Traffic
 
-The live B13 experiment is `benchmark -> s1 Nginx/TLS`. Condition POST bodies
-are weighted 3:1 between the edge App on s2 and authoritative App on s3. The s2
+The live B14 experiment is `benchmark -> s1 Nginx/TLS`. Condition POST bodies
+are weighted 2:1 between the edge App on s2 and authoritative App on s3. The s2
 path decodes and batches up to 64 already-queued compact updates to s3; the s3
 path updates that same state directly. Registration and every public read
 execute on s3; both Apps use MariaDB on s2. Static pages and assets terminate

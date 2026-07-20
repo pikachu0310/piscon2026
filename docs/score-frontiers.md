@@ -147,6 +147,19 @@ work to move saturation downstream.
 - Decision: **current score and overall capacity/correctness champion**. It is
   fully backed up; test 2:1 once to close the measured CPU gap.
 
+### B14: 2:1 edge/direct condition ingress (`aa78bde`)
+
+- Score: 144,824, PASSED, deduction 0
+- Accepted work: 250,251 condition 202, 948 registration 201, 26,206 trend 200
+  and 22,288 condition-read 200
+- Admission quality: condition 499 fell to 516; 98.1% of offered condition
+  attempts succeeded, versus 96.9% in B13
+- Resource balance: s2/s3 App CPU samples were 30.69/28.71 seconds, nearly
+  equal; total App CPU fell 9.4% from B13
+- Decision: retain as the CPU-balance and low-overload frontier. Because offered
+  condition traffic was 11.6% lower, run an exact repeat before selecting the
+  production ratio.
+
 ## Decision rule
 
 Every run is judged on five axes:
