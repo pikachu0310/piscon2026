@@ -140,6 +140,25 @@ func TestConditionStateGenerationKeepsMessagesTogether(t *testing.T) {
 	}
 }
 
+func TestLatestCachedConditionTracksOutOfOrderUpdates(t *testing.T) {
+	state := newConditionState()
+	cacheConditionHistory(state, "isu", []CachedCondition{{Timestamp: 20}, {Timestamp: 10}})
+	if latest, ok := latestCachedCondition(state, "isu"); !ok || latest.Timestamp != 20 {
+		t.Fatalf("first latest = %#v, %v", latest, ok)
+	}
+	cacheConditionHistory(state, "isu", []CachedCondition{{Timestamp: 15}})
+	if latest, ok := latestCachedCondition(state, "isu"); !ok || latest.Timestamp != 20 {
+		t.Fatalf("out-of-order latest = %#v, %v", latest, ok)
+	}
+	cacheConditionHistory(state, "isu", []CachedCondition{{Timestamp: 30}})
+	if latest, ok := latestCachedCondition(state, "isu"); !ok || latest.Timestamp != 30 {
+		t.Fatalf("new latest = %#v, %v", latest, ok)
+	}
+	if _, ok := latestCachedCondition(state, "missing"); ok {
+		t.Fatal("missing history returned a latest condition")
+	}
+}
+
 func TestRegistrationRequestGateDrainsAndReopens(t *testing.T) {
 	gate := newRegistrationRequestGate()
 	gate.enter()
@@ -563,5 +582,56 @@ func BenchmarkForwardStatusDecoderInto(b *testing.B) {
 		if err := decodeForwardedConditionStatusesInto(benchmarkForwardStatusBody, statuses); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+var benchmarkLatestState, benchmarkLatestUUIDs = func() (*ConditionState, []string) {
+	state := newConditionState()
+	uuids := make([]string, 512)
+	for index := range uuids {
+		uuids[index] = fmt.Sprintf("isu-%04d", index)
+		state.histories[uuids[index]] = &ConditionHistory{conditions: []CachedCondition{{Timestamp: int64(index)}}}
+	}
+	state.loaded = true
+	return state, uuids
+}()
+
+var benchmarkLatestTimestamp int64
+
+func benchmarkLatestSnapshot(state *ConditionState) map[string]CachedCondition {
+	state.RLock()
+	histories := make(map[string]*ConditionHistory, len(state.histories))
+	for uuid, history := range state.histories {
+		histories[uuid] = history
+	}
+	state.RUnlock()
+	conditions := make(map[string]CachedCondition, len(histories))
+	for uuid, history := range histories {
+		history.RLock()
+		conditions[uuid] = history.conditions[len(history.conditions)-1]
+		history.RUnlock()
+	}
+	return conditions
+}
+
+func BenchmarkLatestConditionsSnapshot(b *testing.B) {
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		latest := benchmarkLatestSnapshot(benchmarkLatestState)
+		benchmarkLatestTimestamp = latest[benchmarkLatestUUIDs[len(benchmarkLatestUUIDs)-1]].Timestamp
+	}
+}
+
+func BenchmarkLatestConditionsDirect(b *testing.B) {
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		benchmarkLatestState.RLock()
+		for _, uuid := range benchmarkLatestUUIDs {
+			history := benchmarkLatestState.histories[uuid]
+			history.RLock()
+			benchmarkLatestTimestamp = history.conditions[len(history.conditions)-1].Timestamp
+			history.RUnlock()
+		}
+		benchmarkLatestState.RUnlock()
 	}
 }

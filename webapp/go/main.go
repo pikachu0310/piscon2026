@@ -782,24 +782,22 @@ func cachedConditionIsSitting(condition CachedCondition) bool {
 	return condition.Flags&conditionFlagSitting != 0
 }
 
-func snapshotLatestConditions(state *ConditionState) map[string]CachedCondition {
+func latestCachedCondition(state *ConditionState, jiaIsuUUID string) (CachedCondition, bool) {
+	if state == nil {
+		return CachedCondition{}, false
+	}
 	state.RLock()
-	histories := make(map[string]*ConditionHistory, len(state.histories))
-	for uuid, history := range state.histories {
-		histories[uuid] = history
-	}
+	history := state.histories[jiaIsuUUID]
 	state.RUnlock()
-
-	conditions := make(map[string]CachedCondition, len(histories))
-	for uuid, history := range histories {
-		history.RLock()
-		if len(history.conditions) != 0 {
-			latest := history.conditions[len(history.conditions)-1]
-			conditions[uuid] = latest
-		}
-		history.RUnlock()
+	if history == nil {
+		return CachedCondition{}, false
 	}
-	return conditions
+	history.RLock()
+	defer history.RUnlock()
+	if len(history.conditions) == 0 {
+		return CachedCondition{}, false
+	}
+	return history.conditions[len(history.conditions)-1], true
 }
 
 func reloadConditionHistories() error {
@@ -1640,10 +1638,9 @@ func getIsuList(c echo.Context) error {
 
 	responseList := []GetIsuListResponse{}
 	state := currentConditionState()
-	latestConditions := snapshotLatestConditions(state)
 	for _, isu := range isuList {
 		var formattedCondition *GetIsuConditionResponse
-		latestCondition, ok := latestConditions[isu.JIAIsuUUID]
+		latestCondition, ok := latestCachedCondition(state, isu.JIAIsuUUID)
 		if ok {
 			formattedCondition = &GetIsuConditionResponse{
 				JIAIsuUUID:     isu.JIAIsuUUID,
@@ -2339,7 +2336,8 @@ func buildTrendResponse(state *ConditionState) ([]TrendResponse, error) {
 	if registry == nil {
 		return nil, fmt.Errorf("ISU registry is not loaded")
 	}
-	characterList, latestConditions := registry.trendSnapshot()
+	registry.RLock()
+	characterList := append([]string(nil), registry.characters...)
 
 	type groupedConditions struct {
 		info     []*TrendCondition
@@ -2354,15 +2352,22 @@ func buildTrendResponse(state *ConditionState) ([]TrendResponse, error) {
 		}
 	}
 	grouped := map[string]*groupedConditions{}
-	latestByUUID := snapshotLatestConditions(state)
-	for _, row := range latestConditions {
+	state.RLock()
+	for _, row := range registry.trendRows {
 		if _, ok := grouped[row.Character]; !ok {
 			grouped[row.Character] = newGroupedConditions()
 		}
-		latestCondition, ok := latestByUUID[row.JIAIsuUUID]
-		if !ok {
+		history := state.histories[row.JIAIsuUUID]
+		if history == nil {
 			continue
 		}
+		history.RLock()
+		if len(history.conditions) == 0 {
+			history.RUnlock()
+			continue
+		}
+		latestCondition := history.conditions[len(history.conditions)-1]
+		history.RUnlock()
 		trendCondition := &TrendCondition{ID: row.ID, Timestamp: latestCondition.Timestamp}
 		switch cachedConditionLevel(latestCondition) {
 		case conditionLevelInfo:
@@ -2373,6 +2378,8 @@ func buildTrendResponse(state *ConditionState) ([]TrendResponse, error) {
 			grouped[row.Character].critical = append(grouped[row.Character].critical, trendCondition)
 		}
 	}
+	state.RUnlock()
+	registry.RUnlock()
 
 	res := []TrendResponse{}
 	for _, character := range characterList {
