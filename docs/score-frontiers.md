@@ -286,6 +286,33 @@ work to move saturation downstream.
 - Decision: promote as read/unit-cost frontier. B28 is the comparable capacity
   point; B29 verifies the removed snapshot does not return under another mix.
 
+### B30/B31: pooled private batch body (`fff8c99`)
+
+- Scores: B30 151,197; B31 150,099; both PASSED with deduction 0
+- Work/cost: B30 completed 308,123 tracked successes in 52.54 App CPU seconds;
+  B31 completed 292,187 in 46.74 seconds, approximately 0.171 and **0.160
+  ms/success**
+- Local proof: a 64-item body changed from roughly 6--8 us, 33,856 B and 11
+  allocations to 0.13 us, 66 B and two allocations; decoded retained strings
+  do not alias the pooled storage
+- Decision: promote the bounded body pool. It removes the 283 MB s3 allocation
+  site identified in the fresh B24 profile and reduces s3 CPU at comparable
+  work.
+
+### B32/B33: one private batch sender (`4c57dc5`)
+
+- Scores: B32 142,295; B33 149,955; both PASSED with deduction 0
+- B31 eight-worker baseline: 163,952 updates / 158,277 private HTTP batches,
+  average batch 1.036
+- B32/B33 one-sender results: average batch 1.480/1.548 and tracked successes
+  283,503/310,343 in 43.25/48.01 App CPU seconds, approximately **0.153/0.155
+  ms/success**
+- Safety: maximum observed batch was 64; B33 ended with only 13 queued items
+  out of 65,536 and 72 condition 499s, with no new correctness deduction
+- Decision: promote as the current unit-cost and transport-efficiency frontier.
+  B33 exceeds B30's valid work while spending 8.6% less App CPU. Preserve B13
+  independently as the scalar-score/final rollback candidate.
+
 ## Decision rule
 
 Every run is judged on five axes:

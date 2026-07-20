@@ -449,14 +449,54 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 - Promote direct latest selection. B29's lower offered work changes the global
   ratio but does not bring back the measured allocation wall.
 
+### B30/B31 decision: pool the bounded private batch body
+
+- The authoritative s3 handler now reads the length-delimited private batch
+  into a reusable bounded buffer. Decoded UUID and message strings are copied
+  before that buffer returns to the pool, so retained condition history cannot
+  alias a later request. Normal and race tests passed.
+- The isolated 64-item body benchmark moved from roughly 6--8 us, 33,856 B and
+  11 allocations to 0.13 us, 66 B and two allocations.
+- B30 (portal `66511937-0c3f-4252-b432-806933cea9a3`, artifact
+  `20260720T132006.201308Z-s1-9c9d71`) scored 151,197 with 308,123 tracked
+  successes and 52.54 App CPU seconds, about **0.171 ms/success**. s3 App CPU
+  fell from B28's 25.31 to 23.95 seconds at comparable total work.
+- B31 (portal `55d16abd-6216-4ff4-9c67-957d705c4322`, artifact
+  `20260720T132500.695166Z-s1-03c806`) scored 150,099 with 292,187 tracked
+  successes and 46.74 App CPU seconds, about **0.160 ms/success**. Both runs
+  were PASSED with deduction 0. Promote the bounded-body pool.
+
+### B32/B33 decision: coalesce private work with one sender
+
+- Live B31 counters showed eight forwarding workers sent 158,277 private HTTP
+  batches for 163,952 condition updates: average batch size was only 1.036.
+  The nominal batch size of 64 was therefore almost never used.
+- A single sender retains the same 65,536-entry admission queue and 64-item
+  batch cap, but lets concurrently accepted requests accumulate behind the one
+  active private hop. Per-run counters are reset after initialize and captured
+  automatically with the other evidence.
+- B32 (portal `ee862b12-1a2e-470d-9682-a626e494d68f`, artifact
+  `20260720T132833.049797Z-s1-893b0b`) scored 142,295 and completed 283,503
+  tracked successes in 43.25 App CPU seconds, about **0.153 ms/success**. It
+  sent 106,010 private batches for 156,888 updates, average 1.480.
+- B33 (portal `b4e5a8de-9c1c-4656-9c66-d151a9162171`, artifact
+  `20260720T133101.308670Z-s1-cd979d`) scored 149,955 and completed 310,343
+  tracked successes in 48.01 App CPU seconds, about **0.155 ms/success**. It
+  sent 112,952 batches for 174,809 updates, average 1.548; end-of-window queue
+  depth was only 13/65,536 and condition 499 count was 72.
+- Both were PASSED with deduction 0. Private HTTP calls fell about one third,
+  unit CPU cost improved roughly 9% from B28/B30, and B33 accepted more valid
+  work than either eight-worker repeat. Promote one sender even though B32's
+  lower offered/read trajectory reduced its scalar score.
+
 ## Four current-system maps
 
 ### Traffic
 
-The live B14 experiment is `benchmark -> s1 Nginx/TLS`. Condition POST bodies
+The live B33 experiment is `benchmark -> s1 Nginx/TLS`. Condition POST bodies
 are weighted 2:1 between the edge App on s2 and authoritative App on s3. The s2
-path decodes and batches up to 64 already-queued compact updates to s3; the s3
-path updates that same state directly. Registration and every public read
+path decodes and coalesces up to 64 queued compact updates through one private
+sender to s3; the s3 path updates that same state directly. Registration and every public read
 execute on s3; both Apps use MariaDB on s2. Static pages and assets terminate
 on s1.
 
@@ -597,3 +637,16 @@ if their first official score is flat or lower.
 - Authoritative private-batch body `ReadAll` allocated 283 MB in the fresh B24
   profile. Pool the bounded binary body next; prove decoded UUID/message strings
   do not alias the returned buffer before deployment.
+
+### 22:32 JST
+
+- B30/B31 promote the bounded private-body pool. B31's new counters also show
+  the real transport shape: eight workers produce almost one HTTP request per
+  update despite a batch cap of 64.
+- B32/B33 promote one private sender. B33 processes 310,343 tracked successes
+  at about 0.155 ms App CPU each, while average batch size rises to 1.548 and
+  no material queue or error wall appears.
+- The next conversion experiment changes only condition ingress from 2:1 to
+  3:1. B13 proved this ratio can feed more work, while the current edge is much
+  cheaper than B13's implementation. Judge the run on routing, valid work,
+  per-node CPU, queue depth and read tails as well as score.
