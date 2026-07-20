@@ -919,3 +919,10 @@ slow/access/pprof/fgprof/OS計測だけを根拠に次の改善を選ぶ。
 - E54で同一UUIDのdeadlockは消えたが、POST ISUは画像BLOBをINSERTしたtransactionを開いたままJIAの仕様上必要な50ms応答を待ち、その後UPDATE、SELECT、COMMITしている。fgprofではPOST ISUの待ちが累積約198秒あり、登録完了が遅いほどposterと通常シナリオの開始も遅れる。
 - UUID mutex内でknown-UUID cacheを先に確認して既存登録を409にし、JIA成功後に`character`を含む1回のINSERTを行う。JIA 404時はDBへ何も書かず、JIAは同じUUIDの再呼出しを許容する。`LastInsertId`から従来と同じ201 JSONを作る。長いtransaction、UPDATE、SELECT、COMMITだけを除く。
 - 公式prepareの全エラー系、201 JSON、登録成功、p50/p95、JIA待ち、SQL回数、deadlock、condition開始量、scoreを確認する。JIA成功後のDB失敗、ID/character不一致、409不一致、5xx、または登録指標悪化ならE54へ戻す。
+
+### E55 result / rollback
+
+- 公式benchmark `f5a80872-3f51-4bbc-8e87-03ff8d73b179`は130,750点、PASSED、減点0、timeout 285。計測runは`20260720T045028.144629Z-s1-aca6ba`で、全hostが`ANALYZED`、全`errors.txt`は空だった。
+- transaction/UPDATE/SELECT/COMMITを除いたためslow logはE54の37,000→32,290 query、SQL実行時間は4→3秒へ減った。しかしPOST ISUは平均218→252ms、p95 504→655ms、成功889→883件へ悪化し、fgprofのhandler待ちも約198→222 goroutine秒へ増えた。
+- JIA sourceを再確認すると、`/api/activate`はposter goroutineを即座に起動し、その後50ms sleepして応答する。E55はJIA応答後に初めてDB/cacheへ登録したため、その間に届いた最初のconditionを未登録404にした。condition 4xxはE54の5,300→10,702、p95は70→93msとなり、scoreも2.9%低下した。
+- SQLを減らす局所最適化より、「activateより前にconditionを受けられる状態を作る」という順序制約が重要だった。E55を棄却し、UUID mutexを含むE54のtransaction順序へ完全に戻す。
