@@ -48,6 +48,7 @@ const (
 	conditionFlagSitting        = uint8(1 << 3)
 	conditionRequestBufferSize  = 2048
 	conditionForwardBatchLimit  = 64
+	conditionHistoryInitialCap  = 2048
 	forwardBatchRequestBufSize  = 128 * 1024
 )
 
@@ -929,7 +930,50 @@ func cacheConditionHistory(state *ConditionState, jiaIsuUUID string, conditions 
 	history.Lock()
 	needsSort := len(history.conditions) > 0 && len(conditions) > 0 &&
 		conditions[0].Timestamp < history.conditions[len(history.conditions)-1].Timestamp
+	ensureConditionHistoryCapacity(history, len(history.conditions)+len(conditions))
 	history.conditions = append(history.conditions, conditions...)
+	if needsSort {
+		sort.SliceStable(history.conditions, func(i, j int) bool {
+			return history.conditions[i].Timestamp < history.conditions[j].Timestamp
+		})
+	}
+	history.Unlock()
+}
+
+func ensureConditionHistoryCapacity(history *ConditionHistory, required int) {
+	if cap(history.conditions) >= required {
+		return
+	}
+	capacity := cap(history.conditions) * 2
+	if capacity < conditionHistoryInitialCap {
+		capacity = conditionHistoryInitialCap
+	}
+	if capacity < required {
+		capacity = required
+	}
+	grown := make([]CachedCondition, len(history.conditions), capacity)
+	copy(grown, history.conditions)
+	history.conditions = grown
+}
+
+func cacheForwardedConditionHistory(state *ConditionState, jiaIsuUUID string, conditions []ForwardedCondition) {
+	sort.SliceStable(conditions, func(i, j int) bool {
+		return conditions[i].Timestamp < conditions[j].Timestamp
+	})
+	history := getOrCreateConditionHistory(state, jiaIsuUUID)
+	history.Lock()
+	needsSort := len(history.conditions) > 0 && len(conditions) > 0 &&
+		conditions[0].Timestamp < history.conditions[len(history.conditions)-1].Timestamp
+	start := len(history.conditions)
+	ensureConditionHistoryCapacity(history, start+len(conditions))
+	history.conditions = history.conditions[:start+len(conditions)]
+	for index := range conditions {
+		history.conditions[start+index] = CachedCondition{
+			Timestamp: conditions[index].Timestamp,
+			MessageID: internConditionMessage(state, conditions[index].Message),
+			Flags:     conditions[index].Flags,
+		}
+	}
 	if needsSort {
 		sort.SliceStable(history.conditions, func(i, j int) bool {
 			return history.conditions[i].Timestamp < history.conditions[j].Timestamp
@@ -1413,19 +1457,38 @@ func applyEncodedForwardedConditions(body []byte) (int, error) {
 		offset += 4 + messageLength
 	}
 
-	compact := make([]CachedCondition, conditionCount)
+	history := getOrCreateConditionHistory(state, jiaIsuUUID)
+	history.Lock()
+	start := len(history.conditions)
+	ensureConditionHistoryCapacity(history, start+conditionCount)
+	history.conditions = history.conditions[:start+conditionCount]
 	offset = conditionsOffset
+	needsSort := false
+	previousTimestamp := int64(0)
+	if start > 0 {
+		previousTimestamp = history.conditions[start-1].Timestamp
+	}
 	for index := 0; index < conditionCount; index++ {
-		compact[index].Timestamp = int64(binary.LittleEndian.Uint64(body[offset:]))
+		condition := &history.conditions[start+index]
+		condition.Timestamp = int64(binary.LittleEndian.Uint64(body[offset:]))
 		offset += 8
-		compact[index].Flags = body[offset]
+		condition.Flags = body[offset]
 		offset++
 		messageLength := int(binary.LittleEndian.Uint32(body[offset:]))
 		offset += 4
-		compact[index].MessageID = internConditionMessage(state, string(body[offset:offset+messageLength]))
+		condition.MessageID = internConditionMessage(state, string(body[offset:offset+messageLength]))
 		offset += messageLength
+		if (start > 0 || index > 0) && condition.Timestamp < previousTimestamp {
+			needsSort = true
+		}
+		previousTimestamp = condition.Timestamp
 	}
-	cacheConditionHistory(state, jiaIsuUUID, compact)
+	if needsSort {
+		sort.SliceStable(history.conditions, func(i, j int) bool {
+			return history.conditions[i].Timestamp < history.conditions[j].Timestamp
+		})
+	}
+	history.Unlock()
 	return http.StatusAccepted, nil
 }
 
@@ -1485,15 +1548,7 @@ func applyForwardedConditions(jiaIsuUUID string, conditions []ForwardedCondition
 		}
 	}
 
-	compact := make([]CachedCondition, len(conditions))
-	for index := range conditions {
-		compact[index] = CachedCondition{
-			Timestamp: conditions[index].Timestamp,
-			MessageID: internConditionMessage(state, conditions[index].Message),
-			Flags:     conditions[index].Flags,
-		}
-	}
-	cacheConditionHistory(state, jiaIsuUUID, compact)
+	cacheForwardedConditionHistory(state, jiaIsuUUID, conditions)
 	return http.StatusAccepted, nil
 }
 

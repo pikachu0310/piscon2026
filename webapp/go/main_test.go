@@ -159,6 +159,29 @@ func TestLatestCachedConditionTracksOutOfOrderUpdates(t *testing.T) {
 	}
 }
 
+func TestForwardedConditionHistoryAppendsInPlaceAndStaysSorted(t *testing.T) {
+	state := newConditionState()
+	cacheForwardedConditionHistory(state, "isu", []ForwardedCondition{
+		{Timestamp: 20, Message: "twenty", Flags: 2},
+		{Timestamp: 10, Message: "ten", Flags: 1},
+	})
+	cacheForwardedConditionHistory(state, "isu", []ForwardedCondition{
+		{Timestamp: 15, Message: "fifteen", Flags: 3},
+		{Timestamp: 30, Message: "thirty", Flags: 4},
+	})
+	history := state.histories["isu"]
+	if cap(history.conditions) < conditionHistoryInitialCap {
+		t.Fatalf("history capacity = %d, want at least %d", cap(history.conditions), conditionHistoryInitialCap)
+	}
+	wantTimestamps := []int64{10, 15, 20, 30}
+	wantMessages := []string{"ten", "fifteen", "twenty", "thirty"}
+	for index, condition := range history.conditions {
+		if condition.Timestamp != wantTimestamps[index] || conditionMessage(state, condition.MessageID) != wantMessages[index] {
+			t.Fatalf("condition[%d] = %#v message=%q", index, condition, conditionMessage(state, condition.MessageID))
+		}
+	}
+}
+
 func TestRegistrationRequestGateDrainsAndReopens(t *testing.T) {
 	gate := newRegistrationRequestGate()
 	gate.enter()
@@ -664,6 +687,38 @@ func BenchmarkForwardBatchDecoderDirect(b *testing.B) {
 		if _, err := parseForwardedConditionBatchPayloads(benchmarkForwardBatchBody, &payloads); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func BenchmarkCacheForwardedIntermediate(b *testing.B) {
+	state := newConditionState()
+	history := getOrCreateConditionHistory(state, "benchmark-isu")
+	ensureConditionHistoryCapacity(history, conditionHistoryInitialCap)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		history.conditions = history.conditions[:0]
+		compact := make([]CachedCondition, len(benchmarkForwardRequests[0].conditions))
+		for index := range compact {
+			compact[index] = CachedCondition{
+				Timestamp: benchmarkForwardRequests[0].conditions[index].Timestamp,
+				MessageID: internConditionMessage(state, benchmarkForwardRequests[0].conditions[index].Message),
+				Flags:     benchmarkForwardRequests[0].conditions[index].Flags,
+			}
+		}
+		cacheConditionHistory(state, "benchmark-isu", compact)
+	}
+}
+
+func BenchmarkCacheForwardedInPlace(b *testing.B) {
+	state := newConditionState()
+	history := getOrCreateConditionHistory(state, "benchmark-isu")
+	ensureConditionHistoryCapacity(history, conditionHistoryInitialCap)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		history.conditions = history.conditions[:0]
+		cacheForwardedConditionHistory(state, "benchmark-isu", benchmarkForwardRequests[0].conditions)
 	}
 }
 
