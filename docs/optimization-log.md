@@ -888,3 +888,9 @@ slow/access/pprof/fgprof/OS計測だけを根拠に次の改善を選ぶ。
 - vendor JSの207,404-byte配信とs1平均TX約31.6MB/sは再現したが、登録成功は866件、condition 202は232,776件、scoreは128,492点に留まった。POST ISUには500も1件発生した。初回122,381点と合わせ、通信量の直接指標が改善しても負荷生成量と公式scoreが2回とも明確に悪化したため棄却する。
 - 調査中に、同じ`gzip_static`実験は過去のE35で133,148点・減点44として既に棄却済みだったことを再発見した。再開時に文書末尾だけを中心に読み、実験表の`pending`行と後段のE35 resultを突合しなかったため、既知の失敗を重複して試した。今後は実装前に仮説名、変更するdirective/function、関連metricを全文検索し、過去の採否とrollback理由を確認する。
 - `gzip_static on`を外し、E51で採用したrequest buffering onのNginx設定へ戻す。再測定2回は無駄ではなく、ベンチマーカーを含む閉ループではserver側の転送量削減が必ずしもscoreへ変換されないことと、長時間自走では実験台帳の機械的な重複検査が必要なことを再確認した。
+
+### E53 expectation
+
+- E50ではISUメタデータcacheとcondition request buffering onを同時に入れた。E51はcacheありのままstreamingへ戻したため、比較できたのはbufferingの差だけで、cache自体の公式scoreへの影響は分離できていない。
+- B49のcacheなし＋streamingは151,247点、E51のcacheあり＋streamingは138,586点だった。read SQL、latency、fgprofはcacheで改善した一方、App/DBには元々余力があり、2回のE50も138,810点・143,994点に留まった。局所的なread改善が得点制約でない可能性が高い。
+- E53ではappだけをB49と同じknown-UUID cache＋read SQLへ戻し、Nginxのrequest buffering onは維持する。これによりbuffering単体を評価する。公式valid、登録成功、condition 202/4xx、1登録あたり202、body read待ち、read SQL、scoreを比較し、B49を上回るかbufferingの直接指標を維持すれば採用する。scoreとcondition throughputが悪ければB49のstreamingへ戻す。
