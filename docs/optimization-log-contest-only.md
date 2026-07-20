@@ -35,6 +35,7 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 | B13 | 20:42 | `eeafca4` effective | Send condition POSTs 3:1 to the batched s2 edge and directly to authoritative s3 | B11/B12 left edge CPU above authoritative CPU; every route still updates the sole s3 generation | portal `04b6a6bd-0294-474c-9424-37a5c0603e9a`; artifact `20260720T114250.931832Z-s1-c1eddf` | **162,980**, PASSED, deduction 0 | New scalar, condition-ingest, and balanced-capacity champion; test 2:1 to close the remaining CPU gap |
 | B14 | 20:49 | `aa78bde` | Change condition ingress from 3:1 to 2:1 edge:direct | B13 App CPU samples were 36.31s on s2 and 29.26s on s3 | portal `fd30ddd0-6e24-4eb7-8187-44779e45b15c`; artifact `20260720T114923.209743Z-s1-f2e80d` | **144,824**, PASSED, deduction 0 | CPU-balance and low-overload frontier, not an automatic regression; offered condition load was 11.6% lower, so repeat exactly |
 | B15 | 20:53 | `aa78bde` | Exact repeat of the 2:1 edge:direct split | Separate ratio behavior from B14's offered-load trajectory | portal `fe92aa0a-306f-4300-b958-cc61bea2c383`; artifact `20260720T115346.002992Z-s1-8fcb16` | **150,001**, PASSED, deduction 0 | Confirms a stable CPU-balance/low-failure frontier; use it as the isolation base for the metadata registry |
+| B16 | 21:00 | `0164d14` App + `aa78bde` Nginx | Build an initialize-time ISU metadata registry and publish registrations after commit | B13 slow log: 46.59k queries; 26,140 repeated ownership/name SELECTs used 3.85s | portal `bd59ce1c-e5ca-481a-94f4-248094d2b494`; artifact `20260720T120057.641902Z-s1-f0a807` | **155,390**, PASSED, deduction 0 | Proven unit-cost/read-path improvement on stable 2:1 base; combine with B13's 3:1 ratio next |
 
 ### B0 facts
 
@@ -275,6 +276,25 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   an isolation base: replace repeated public-read metadata SELECTs with an
   initialize-time registry, then combine a proven win with the B13 ratio.
 
+### B16 decision: the metadata registry removed the measured SQL wall
+
+- Initialize now loads owner/name/character/ID metadata into one indexed
+  generation. List, detail, graph authorization, condition authorization/name
+  and trend reads use that registry. A successful registration is published to
+  it only after the MariaDB transaction commits; MariaDB remains durable truth.
+- Slow-log volume fell from B13's 46.59k queries to **7.31k** (-84.3%), unique
+  query shapes fell 17 -> 12 and measured DB execution fell 9s -> 2s. The
+  former 26,140-call ownership/name SELECT disappeared completely.
+- On the stable 2:1 base, s3 App CPU fell 28.68 -> 24.38 sampled seconds (-15%)
+  from B15; total sampled App CPU fell 59.33 -> 54.67 seconds (-7.9%). s2 App
+  CPU remained essentially flat at 30.29 seconds, locating the saving exactly
+  on the metadata-reading node.
+- Score rose 150,001 -> 155,390. The run still completed 246,147 condition
+  writes, 947 registrations, 26,346 trend reads and 23,386 condition reads;
+  condition 499 was only 111. This is a real unit-cost/read-capacity improvement,
+  not a score-only workload shift.
+- B17 restores B13's 3:1 score/peak-ingest ratio while keeping the registry.
+
 ## Four current-system maps
 
 ### Traffic
@@ -363,3 +383,11 @@ if their first official score is flat or lower.
 - The remaining topology signal is an s2:s3 App CPU sample ratio of 36.31:29.26.
   Test 2:1 next, then stop tuning this ratio if score/work/unit-cost do not move
   together and return to the metadata/state-index structural families.
+
+### 21:02 JST
+
+- B14/B15 established a stable 2:1 reference. B16's isolated metadata registry
+  cut database calls 84%, s3 App CPU 15% and total App CPU 8%, while raising
+  score and preserving valid work.
+- The registry family is promoted. Convert it with the 3:1 champion ratio next;
+  then profile the new system instead of continuing to tune removed SQL calls.

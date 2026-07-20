@@ -171,6 +171,20 @@ work to move saturation downstream.
 - Decision: 2:1 is a reproducible CPU-balance/low-overload frontier. Keep B13's
   3:1 as score/peak-ingest champion and use 2:1 to isolate the next code change.
 
+### B16: initialize-time metadata registry (`0164d14`)
+
+- Score: 155,390, PASSED, deduction 0
+- Accepted work: 246,147 condition 202, 947 registration 201, 26,346 trend 200
+  and 23,386 condition-read 200; only 111 condition 499
+- Database effect: 46.59k -> 7.31k measured queries (-84.3%), 9s -> 2s DB
+  execution; the former 26,140-call ownership/name query is gone
+- Unit cost: s3 App CPU 28.68 -> 24.38 seconds (-15%) and total App CPU 59.33
+  -> 54.67 seconds (-7.9%) versus the exact B15 base
+- Correctness: initialize swaps a complete index generation; new metadata is
+  published only after successful JIA activation and DB commit
+- Decision: promote as a proven read/unit-cost frontier and test it with B13's
+  score-champion 3:1 ingress ratio.
+
 ## Decision rule
 
 Every run is judged on five axes:
