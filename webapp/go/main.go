@@ -592,9 +592,13 @@ func getUserIDFromSession(c echo.Context) (string, int, error) {
 	return jiaUserID, 0, nil
 }
 
-func getJIAServiceURL(tx *sqlx.Tx) string {
+type sqlxGetter interface {
+	Get(dest interface{}, query string, args ...interface{}) error
+}
+
+func getJIAServiceURL(getter sqlxGetter) string {
 	var config Config
-	err := tx.Get(&config, "SELECT * FROM `isu_association_config` WHERE `name` = ?", "jia_service_url")
+	err := getter.Get(&config, "SELECT * FROM `isu_association_config` WHERE `name` = ?", "jia_service_url")
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			log.Print(err)
@@ -873,28 +877,16 @@ func postIsu(c echo.Context) error {
 	registrationLock.Lock()
 	defer registrationLock.Unlock()
 
-	tx, err := db.Beginx()
+	known, err := isKnownIsu(jiaIsuUUID)
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
-	defer tx.Rollback()
-
-	_, err = tx.Exec("INSERT INTO `isu`"+
-		"	(`jia_isu_uuid`, `name`, `image`, `jia_user_id`) VALUES (?, ?, ?, ?)",
-		jiaIsuUUID, isuName, image, jiaUserID)
-	if err != nil {
-		mysqlErr, ok := err.(*mysql.MySQLError)
-
-		if ok && mysqlErr.Number == uint16(mysqlErrNumDuplicateEntry) {
-			return c.String(http.StatusConflict, "duplicated: isu")
-		}
-
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+	if known {
+		return c.String(http.StatusConflict, "duplicated: isu")
 	}
 
-	targetURL := getJIAServiceURL(tx) + "/api/activate"
+	targetURL := getJIAServiceURL(db) + "/api/activate"
 	body := JIAServiceRequest{postIsuConditionTargetBaseURL, jiaIsuUUID}
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
@@ -934,26 +926,27 @@ func postIsu(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	_, err = tx.Exec("UPDATE `isu` SET `character` = ? WHERE  `jia_isu_uuid` = ?", isuFromJIA.Character, jiaIsuUUID)
+	result, err := db.Exec("INSERT INTO `isu`"+
+		"	(`jia_isu_uuid`, `name`, `image`, `character`, `jia_user_id`) VALUES (?, ?, ?, ?, ?)",
+		jiaIsuUUID, isuName, image, isuFromJIA.Character, jiaUserID)
 	if err != nil {
+		mysqlErr, ok := err.(*mysql.MySQLError)
+		if ok && mysqlErr.Number == uint16(mysqlErrNumDuplicateEntry) {
+			return c.String(http.StatusConflict, "duplicated: isu")
+		}
+
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	var isu Isu
-	err = tx.Get(
-		&isu,
-		"SELECT `id`, `jia_isu_uuid`, `name`, `character` FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
-		jiaUserID, jiaIsuUUID)
+	isuID, err := result.LastInsertId()
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
-
-	err = tx.Commit()
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+	isu := Isu{
+		ID: int(isuID), JIAIsuUUID: jiaIsuUUID, Name: isuName,
+		Character: isuFromJIA.Character,
 	}
 
 	cacheKnownIsu(jiaIsuUUID)

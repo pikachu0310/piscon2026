@@ -907,3 +907,15 @@ slow/access/pprof/fgprof/OS計測だけを根拠に次の改善を選ぶ。
 - E53直後の`SHOW ENGINE INNODB STATUS`では、同じ`jia_isu_uuid`を登録する2 transactionがdeadlockしていた。先行requestはUNIQUE indexのX lockを保持してJIA応答後のUPDATEを待ち、1秒timeout後に再送されたrequestが同じUUIDをINSERTしてS lockを待つことで循環した。MariaDBは再送側をvictimにしてerror 1213を返し、公式benchではPOST ISUの500として4点減点された。
 - 公式bench sourceではload中のPOST ISUを成功するまで再送し、409は「先行登録が完了した」として正常終了する。そこでUUID単位のmutexをtransaction開始前に取り、同じUUIDの登録だけを直列化する。先行requestがcommitした後の再送は既存のUNIQUE判定で409となる。異なるUUID、JIA、DB transaction、画像、response JSONは変えない。
 - prepareの未認証・登録済み・他user重複・存在しないUUIDを維持し、公式valid、POST ISUの500/deadlock、201/409、登録成功、p95、scoreを確認する。deadlockが残る、異なるUUIDまで待たせる、prepare不一致、またはscore/登録量が悪化すればmutexを外す。
+
+### E54 result
+
+- 公式benchmark `b9919242-1dfc-4c10-8a76-c571c3a8fc77`は134,668点、PASSED、減点0、timeout 266。計測runは`20260720T044045.936053Z-s1-4f2db7`で、全hostが`ANALYZED`、全`errors.txt`は空だった。
+- POST ISUは922件中201が889件、4xxが33件、5xxは0。p95はE53の595→504ms、MariaDBの最大query/lock待ちは464msから9msへ低下し、E53のdeadlock 4件は再発しなかった。UUID単位のmutexは異なる登録を止めず、狙った互換性と信頼性を満たしたため採用する。
+- condition 202は234,765件、登録成功1件あたり約264.1件で、B49の約253.3件を上回った。公式scoreはB49を下回るが、登録成功数自体が976→889件と少ないrunだった。値を変えずに明確な500/減点を除き、登録p95も改善したため、scoreの絶対値だけでrollbackしない。
+
+### E55 expectation
+
+- E54で同一UUIDのdeadlockは消えたが、POST ISUは画像BLOBをINSERTしたtransactionを開いたままJIAの仕様上必要な50ms応答を待ち、その後UPDATE、SELECT、COMMITしている。fgprofではPOST ISUの待ちが累積約198秒あり、登録完了が遅いほどposterと通常シナリオの開始も遅れる。
+- UUID mutex内でknown-UUID cacheを先に確認して既存登録を409にし、JIA成功後に`character`を含む1回のINSERTを行う。JIA 404時はDBへ何も書かず、JIAは同じUUIDの再呼出しを許容する。`LastInsertId`から従来と同じ201 JSONを作る。長いtransaction、UPDATE、SELECT、COMMITだけを除く。
+- 公式prepareの全エラー系、201 JSON、登録成功、p50/p95、JIA待ち、SQL回数、deadlock、condition開始量、scoreを確認する。JIA成功後のDB失敗、ID/character不一致、409不一致、5xx、または登録指標悪化ならE54へ戻す。
