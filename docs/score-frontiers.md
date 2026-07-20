@@ -221,6 +221,20 @@ work to move saturation downstream.
   attempts while the score-producing read mix fell, so score alone would give
   the wrong rollback decision.
 
+### B20/B21: bounded fgprof observer (`d16ca58` in the toolkit)
+
+- Scores: B20 149,862; B21 146,300; both PASSED with deduction 0
+- Accepted condition work: 251,473 and **253,410**, versus B19's 249,242;
+  tracked successful totals were 301,666 and 302,305 versus 298,779
+- Failures: condition 499 was 63 and 132 versus B19's 1,049
+- Observer cost: combined CPU-profile `runtime.gentraceback` fell from 5.07
+  seconds to 2.57/2.49 seconds while both Apps retained a 15-second late-load
+  fgprof, and every other evidence source remained 60 seconds
+- Decision: promote the bounded observer as the measurement baseline. B20 is
+  the lower-CPU point; B21 is the higher-ingest repeat. Their score difference
+  is caused by read/workload mix and is not grounds to restore the expensive
+  full-minute fgprof.
+
 ## Decision rule
 
 Every run is judged on five axes:

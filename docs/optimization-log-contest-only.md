@@ -349,6 +349,26 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   capacity into useful reads; do not undo it merely because one official run
   scored 4.0% lower.
 
+### B20/B21 decision: keep full evidence, bound the expensive observer
+
+- CPU pprof, access/slow logs, sar and pidstat still cover the complete 60
+  seconds. Only fgprof changed from a full-minute capture to a representative
+  15-second window beginning at second 40; the exact window is recorded in
+  every host's `meta.json`.
+- B20 scored 149,862 and completed 251,473 condition writes; B21 scored 146,300
+  and completed **253,410**. Their four tracked successful request totals were
+  301,666 and 302,305, both above B19's 298,779.
+- Condition 499 fell from B19's 1,049 to 63 and 132. CPU-profile
+  `runtime.gentraceback` across both Apps fell from 5.07 seconds to 2.57 and
+  2.49 seconds. Both runs retained useful 15-second fgprof files and had zero
+  capture errors.
+- B20's total App CPU was 55.79 seconds and B21's was 57.52 as B21 admitted
+  more condition work. The exact repeat therefore exposes workload variance,
+  but it also reproduces the observer-specific saving and healthy admission.
+- Promote the bounded window as the measurement baseline. This is not hiding
+  diagnostics to inflate score: the expensive wall profiler remains present
+  at peak load, while the other four evidence streams remain full-duration.
+
 ## Four current-system maps
 
 ### Traffic
@@ -454,3 +474,12 @@ if their first official score is flat or lower.
 - Keep the decoder as a unit-cost frontier. The next experiments target costs
   visible in the new profile, with an exact repeat whenever offered-load
   variance could otherwise dominate the conclusion.
+
+### 21:36 JST
+
+- B20/B21 validate a late 15-second fgprof window. Both runs process more valid
+  work than B19, keep complete CPU/access/slow/OS evidence, and halve measured
+  stack-walk CPU while retaining useful off-CPU profiles.
+- The new profile now attributes 2.18 seconds on s2 and 1.58 seconds on s3 to
+  request-body `io.ReadAll`. Measured condition requests are about 1.5 KiB and
+  stay below 2 KiB, so a bounded pooled-body experiment is next.
