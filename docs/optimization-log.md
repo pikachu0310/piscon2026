@@ -926,3 +926,25 @@ slow/access/pprof/fgprof/OS計測だけを根拠に次の改善を選ぶ。
 - transaction/UPDATE/SELECT/COMMITを除いたためslow logはE54の37,000→32,290 query、SQL実行時間は4→3秒へ減った。しかしPOST ISUは平均218→252ms、p95 504→655ms、成功889→883件へ悪化し、fgprofのhandler待ちも約198→222 goroutine秒へ増えた。
 - JIA sourceを再確認すると、`/api/activate`はposter goroutineを即座に起動し、その後50ms sleepして応答する。E55はJIA応答後に初めてDB/cacheへ登録したため、その間に届いた最初のconditionを未登録404にした。condition 4xxはE54の5,300→10,702、p95は70→93msとなり、scoreも2.9%低下した。
 - SQLを減らす局所最適化より、「activateより前にconditionを受けられる状態を作る」という順序制約が重要だった。E55を棄却し、UUID mutexを含むE54のtransaction順序へ完全に戻す。
+
+## 10h prompt continuation: final accepted configuration
+
+- 継続探索ではE54だけを新規採用した。同じ`jia_isu_uuid`の並行POST ISUをUUID単位で直列化し、先行requestのcommit後に再送を既存の409経路へ通す。E53で4件発生したMariaDB deadlock/HTTP 500をE54では0件にし、prepareの重複仕様と異なるUUIDの並列性を維持した。
+- E50のISUメタデータcache、E53のcondition request buffering on、E52の`gzip_static`、E55のJIA応答後single INSERTは最終構成に含めない。特にE55から、JIAはposterを起動してから50ms後に応答するため、activate前にISU行とknown-UUID状態を用意しなければ最初のconditionを404にすることが分かった。
+- `bin/isuctl final`で全3台をfinal modeへ切り替えて再起動した。全台のuptimeが0分へ戻った後、`final-check.sh`を二度実行し、final mode永続化、trigger daemon停止、active run/processなし、s1 access log停止、s2 slow query log停止、各role service activeを確認した。
+- 再起動後の公式benchmark `2ca96ff8-9c63-40a2-9e1d-093a21448111`は**139,772点、PASSED、減点0、timeout 369**。final modeでは計測を起動しないため新しいrunはなく、最新runはE55の`20260720T045028.144629Z-s1-aca6ba`のままである。これにより「final mode＋全台再起動後にvalid」の完了条件を満たした。
+- 継続探索のmeasure最高値は変更前B49の151,247点、新規採用E54は134,668点、最終final値は139,772点だった。E54はscore最高値更新ではなく、再現した500/減点を値変更なしで除き、POST ISU p95とDB lock tailも改善した信頼性修正として採用した。1分runのscore差と、直接原因が確定したcorrectness/reliability修正を分けて判断している。
+
+最終topologyは引き続きs1=Nginx、s2=MariaDB、s3=Go appである。最終documentation追記前のGit HEADは`36f08f6e52334be18e0457158395226db9f54c8e`。実機とGitで一致したSHA-256は次の通り。
+
+| 対象 | SHA-256 |
+|---|---|
+| s3 `main.go` / Git `webapp/go/main.go` | `c00d8b160d927db16817c27db30bee81b56ebeebd264b99190418cfd290411a0` |
+| s3 app binary | `3dd03256c0316d7de0cc32102a618bdb898218e1afed95baab0edd7e0a9145f2` |
+| s1 Nginx site / Git config | `9ad5ce44a6e0417c104b8db6605a08c64a2a9ec6debd59a0b30a818b432e81af` |
+| s2 MariaDB config / Git config | `b7462f1f41615fa7a733871d2aed3969973708e02497d0f5526e8e4e10ea31af` |
+| s3 `0_Schema.sql` / Git schema | `a0d264994e4a28655cdba49eb4fa63d2cdc58ebfee900b9a3b701df199f5f824` |
+| s3 `init.sh` / Git script | `e4a71dc633e72dbf327fdfbecf886cc15fe22ecab661b629a8cb37b132452c19` |
+| 初期image由来 `1_InitData.sql` | `de0bf82043d189783987007288f98c6c071baee9f74154596ff48b824373a6a2` |
+
+再開時の運用上の反省は、長い実験記録を末尾だけ読まないこと。E52は過去のE35で既に棄却したgzipを重複して試した。実装前に「仮説名」「変更するdirective/function」「対象metric」を全文検索し、表のpending欄だけでなく本文のresult/rollbackまで突合する。今回の重複試行そのものもE52へ記録し、次のAgentが同じ失敗を繰り返さない状態にした。
