@@ -16,8 +16,15 @@
 
 ## Capacity frontier
 
-None yet. A candidate belongs here only when post-start evidence shows increased
-valid offered work, lower unit cost, or a causal downstream bottleneck shift.
+### B1: ingress buffering (`891c84e`)
+
+- Score: 131,466, PASSED, deduction 0 (-2.1% from B0)
+- Valid work: condition 202 fell 6.4%; registration success fell 1.9%
+- Unit cost: App CPU samples fell 14.7%, about 9% per successful condition
+- Bottleneck shift: Go handler body wait disappeared and read tails improved,
+  but Nginx-side slow uploads produced 40.5% more client-aborted 499 responses
+- Decision: mechanism retained as a branch commit, but not used alone. Restore
+  B0 streaming and revisit only with a downstream admission/worker design.
 
 ## Decision rule
 

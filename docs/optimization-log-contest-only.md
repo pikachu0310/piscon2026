@@ -20,16 +20,18 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 | ID | Time JST | Commit | Hypothesis / bundle | Direct evidence | Benchmark / run | Score / validity | Frontier decision |
 |---|---|---|---|---|---|---|---|
 | B0 | 18:27 | `e70329f` | Unmodified starting checkout and live deployment | Fresh measure capture: access, slow log, CPU pprof, fgprof, pidstat and sar | portal `8c9bab42-1521-421b-8be1-23e77a008fea`; artifact `20260720T092734.057516Z-s1-a948bf` | **134,310**, PASSED, deduction 0 | Initial score champion |
+| B1 | 18:42 | `891c84e` | Buffer complete condition request bodies at s1 before proxying to Go | Compare ingress status, handler wall, CPU, valid work and read latency with B0 | portal `c92807fa-0864-414d-8562-a3506f433a4b`; artifact `20260720T094228.582644Z-s1-af6c1c` | 131,466, PASSED, deduction 0 | Capacity result but not champion; keep commit, restore streaming for next isolated test |
 
 ### B0 facts
 
 - Condition ingestion dominated traffic: 250,829 attempts, 243,741 HTTP 202,
-  3,943 HTTP 400, 3,073 HTTP 499 and 72 HTTP 404. Successful requests
+  3,943 HTTP 400, 3,073 HTTP 499 and 72 HTTP 404. The 400s carried only
+  8.5 bytes on average and are malformed probes, not capacity failures. Successful requests
   covered 850 UUIDs and carried 353.9 MiB of request data.
 - Successful condition request time was 9.92 ms average, 60 ms p95 and
   93 ms p99. Attempts rose from about 1.3k/s to 6-7k/s. Partial/cancelled
-  uploads increased late in the run; the 400 responses averaged 265 ms and
-  the 499 responses averaged 106 ms.
+  uploads increased late in the run; the meaningful overload signal is the
+  499 group, which averaged 106 ms and reached 3.9% in the final five seconds.
 - Registration produced 893 HTTP 201 responses. It averaged 242 ms with a
   603 ms p95. Four requests ended as 499.
 - App CPU pprof sampled 37.03 CPU-seconds. `postIsuCondition` accounted for
@@ -44,6 +46,20 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 - DB metadata work is nevertheless a capacity-frontier candidate: metadata
   SELECTs were 2,178/2,750 queries; list/trend scans were 191.6k/193.6k rows
   examined and trend metadata returned about 90% of DB response bytes.
+
+### B1 decision: buffering isolated App work but hurt admission
+
+- Official score moved -2.1%, registration success 893 -> 876 (-1.9%), and
+  condition 202 count 243,741 -> 228,059 (-6.4%). Condition 499 increased
+  3,073 -> 4,319; aborted uploads contained only 38 bytes on average.
+- On the positive side, CPU samples fell 37.03 -> 31.59 seconds (-14.7%), or
+  about 9% less total App CPU per successful condition. The slow body wait
+  disappeared from `postIsuCondition`, read endpoint tail latency collapsed,
+  and trend average fell from 6.7 ms to 1.9 ms.
+- This proves an ingress-isolation mechanism but does not convert to more
+  accepted condition work: buffering makes slow uploaders hit their client
+  deadline before proxying. It is recorded as a capacity result, not selected
+  as score champion. Streaming is restored before testing static compression.
 
 ## Four current-system maps
 
