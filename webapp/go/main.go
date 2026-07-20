@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
@@ -42,6 +43,7 @@ const (
 	scoreConditionLevelWarning  = 2
 	scoreConditionLevelCritical = 1
 	trendCacheTTL               = 100 * time.Millisecond
+	conditionFlagSitting        = uint8(1 << 3)
 )
 
 var (
@@ -53,12 +55,6 @@ var (
 	jiaJWTSigningKey *ecdsa.PublicKey
 
 	postIsuConditionTargetBaseURL string // JIAへのactivate時に登録する，ISUがconditionを送る先のURL
-
-	trendCache = struct {
-		sync.Mutex
-		body      []byte
-		expiresAt time.Time
-	}{}
 
 	sessionCache = struct {
 		sync.RWMutex
@@ -78,23 +74,38 @@ var (
 
 	isuRegistrationLocks sync.Map
 
-	conditionHistoryCache = struct {
-		sync.RWMutex
-		histories map[string]*ConditionHistory
-		loaded    bool
-	}{histories: make(map[string]*ConditionHistory)}
+	conditionState atomic.Value // *ConditionState; swapped as one initialize generation
 
-	canonicalConditionStrings = map[string]string{
-		"is_dirty=false,is_overweight=false,is_broken=false": "is_dirty=false,is_overweight=false,is_broken=false",
-		"is_dirty=true,is_overweight=false,is_broken=false":  "is_dirty=true,is_overweight=false,is_broken=false",
-		"is_dirty=false,is_overweight=true,is_broken=false":  "is_dirty=false,is_overweight=true,is_broken=false",
-		"is_dirty=true,is_overweight=true,is_broken=false":   "is_dirty=true,is_overweight=true,is_broken=false",
-		"is_dirty=false,is_overweight=false,is_broken=true":  "is_dirty=false,is_overweight=false,is_broken=true",
-		"is_dirty=true,is_overweight=false,is_broken=true":   "is_dirty=true,is_overweight=false,is_broken=true",
-		"is_dirty=false,is_overweight=true,is_broken=true":   "is_dirty=false,is_overweight=true,is_broken=true",
-		"is_dirty=true,is_overweight=true,is_broken=true":    "is_dirty=true,is_overweight=true,is_broken=true",
+	conditionBitsByString = map[string]uint8{
+		"is_dirty=false,is_overweight=false,is_broken=false": 0,
+		"is_dirty=true,is_overweight=false,is_broken=false":  1,
+		"is_dirty=false,is_overweight=true,is_broken=false":  2,
+		"is_dirty=true,is_overweight=true,is_broken=false":   3,
+		"is_dirty=false,is_overweight=false,is_broken=true":  4,
+		"is_dirty=true,is_overweight=false,is_broken=true":   5,
+		"is_dirty=false,is_overweight=true,is_broken=true":   6,
+		"is_dirty=true,is_overweight=true,is_broken=true":    7,
 	}
-	conditionMessageInterner sync.Map
+	conditionStringByBits = [8]string{
+		"is_dirty=false,is_overweight=false,is_broken=false",
+		"is_dirty=true,is_overweight=false,is_broken=false",
+		"is_dirty=false,is_overweight=true,is_broken=false",
+		"is_dirty=true,is_overweight=true,is_broken=false",
+		"is_dirty=false,is_overweight=false,is_broken=true",
+		"is_dirty=true,is_overweight=false,is_broken=true",
+		"is_dirty=false,is_overweight=true,is_broken=true",
+		"is_dirty=true,is_overweight=true,is_broken=true",
+	}
+	conditionLevelByBits = [8]string{
+		conditionLevelInfo,
+		conditionLevelWarning,
+		conditionLevelWarning,
+		conditionLevelWarning,
+		conditionLevelWarning,
+		conditionLevelWarning,
+		conditionLevelWarning,
+		conditionLevelCritical,
+	}
 
 	conditionWriteBarrier sync.RWMutex
 )
@@ -142,7 +153,27 @@ type ConditionHistory struct {
 	conditions []CachedCondition
 }
 
+type ConditionState struct {
+	sync.RWMutex
+	histories map[string]*ConditionHistory
+	loaded    bool
+
+	messageMu  sync.RWMutex
+	messages   []string
+	messageIDs map[string]uint32
+
+	trendMu        sync.Mutex
+	trendBody      []byte
+	trendExpiresAt time.Time
+}
+
 type CachedCondition struct {
+	Timestamp int64
+	MessageID uint32
+	Flags     uint8
+}
+
+type IncomingCondition struct {
 	Timestamp int64  `json:"timestamp"`
 	Condition string `json:"condition"`
 	Message   string `json:"message"`
@@ -337,10 +368,14 @@ func getSession(r *http.Request) (*sessions.Session, error) {
 }
 
 func invalidateTrendCache() {
-	trendCache.Lock()
-	trendCache.body = nil
-	trendCache.expiresAt = time.Time{}
-	trendCache.Unlock()
+	state := currentConditionState()
+	if state == nil {
+		return
+	}
+	state.trendMu.Lock()
+	state.trendBody = nil
+	state.trendExpiresAt = time.Time{}
+	state.trendMu.Unlock()
 }
 
 func clearSessionCache() {
@@ -417,13 +452,73 @@ func isKnownIsu(jiaIsuUUID string) (bool, error) {
 	return count != 0, nil
 }
 
-func snapshotLatestConditions() map[string]CachedCondition {
-	conditionHistoryCache.RLock()
-	histories := make(map[string]*ConditionHistory, len(conditionHistoryCache.histories))
-	for uuid, history := range conditionHistoryCache.histories {
+func newConditionState() *ConditionState {
+	return &ConditionState{
+		histories:  make(map[string]*ConditionHistory),
+		messages:   []string{""},
+		messageIDs: map[string]uint32{"": 0},
+	}
+}
+
+func currentConditionState() *ConditionState {
+	value := conditionState.Load()
+	if value == nil {
+		return nil
+	}
+	return value.(*ConditionState)
+}
+
+func internConditionMessage(state *ConditionState, message string) uint32 {
+	state.messageMu.RLock()
+	id, ok := state.messageIDs[message]
+	state.messageMu.RUnlock()
+	if ok {
+		return id
+	}
+
+	state.messageMu.Lock()
+	defer state.messageMu.Unlock()
+	if id, ok = state.messageIDs[message]; ok {
+		return id
+	}
+	id = uint32(len(state.messages))
+	state.messages = append(state.messages, message)
+	state.messageIDs[message] = id
+	return id
+}
+
+func conditionMessage(state *ConditionState, id uint32) string {
+	state.messageMu.RLock()
+	defer state.messageMu.RUnlock()
+	if int(id) >= len(state.messages) {
+		return ""
+	}
+	return state.messages[id]
+}
+
+func cachedConditionBits(condition CachedCondition) uint8 {
+	return condition.Flags & 0x07
+}
+
+func cachedConditionString(condition CachedCondition) string {
+	return conditionStringByBits[cachedConditionBits(condition)]
+}
+
+func cachedConditionLevel(condition CachedCondition) string {
+	return conditionLevelByBits[cachedConditionBits(condition)]
+}
+
+func cachedConditionIsSitting(condition CachedCondition) bool {
+	return condition.Flags&conditionFlagSitting != 0
+}
+
+func snapshotLatestConditions(state *ConditionState) map[string]CachedCondition {
+	state.RLock()
+	histories := make(map[string]*ConditionHistory, len(state.histories))
+	for uuid, history := range state.histories {
 		histories[uuid] = history
 	}
-	conditionHistoryCache.RUnlock()
+	state.RUnlock()
 
 	conditions := make(map[string]CachedCondition, len(histories))
 	for uuid, history := range histories {
@@ -438,6 +533,7 @@ func snapshotLatestConditions() map[string]CachedCondition {
 }
 
 func reloadConditionHistories() error {
+	state := newConditionState()
 	rows, err := db.Queryx(
 		"SELECT `jia_isu_uuid`, `timestamp`, `is_sitting`, `condition`, `message`" +
 			" FROM `isu_condition` ORDER BY `jia_isu_uuid`, `timestamp`, `id`")
@@ -446,64 +542,59 @@ func reloadConditionHistories() error {
 	}
 	defer rows.Close()
 
-	histories := make(map[string]*ConditionHistory)
 	for rows.Next() {
 		var condition IsuCondition
 		if err = rows.StructScan(&condition); err != nil {
 			return err
 		}
-		history := histories[condition.JIAIsuUUID]
+		history := state.histories[condition.JIAIsuUUID]
 		if history == nil {
 			history = &ConditionHistory{}
-			histories[condition.JIAIsuUUID] = history
+			state.histories[condition.JIAIsuUUID] = history
 		}
-		canonical, ok := canonicalConditionStrings[condition.Condition]
+		bits, ok := conditionBitsByString[condition.Condition]
 		if !ok {
 			return fmt.Errorf("invalid condition in baseline: %q", condition.Condition)
 		}
+		flags := bits
+		if condition.IsSitting {
+			flags |= conditionFlagSitting
+		}
 		history.conditions = append(history.conditions, CachedCondition{
 			Timestamp: condition.Timestamp.Unix(),
-			Condition: canonical,
-			Message:   internConditionMessage(condition.Message),
-			IsSitting: condition.IsSitting,
+			MessageID: internConditionMessage(state, condition.Message),
+			Flags:     flags,
 		})
 	}
 	if err = rows.Err(); err != nil {
 		return err
 	}
 
-	conditionHistoryCache.Lock()
-	conditionHistoryCache.histories = histories
-	conditionHistoryCache.loaded = true
-	conditionHistoryCache.Unlock()
+	state.loaded = true
+	conditionState.Store(state)
 	return nil
 }
 
-func internConditionMessage(message string) string {
-	value, _ := conditionMessageInterner.LoadOrStore(message, message)
-	return value.(string)
-}
-
-func getOrCreateConditionHistory(jiaIsuUUID string) *ConditionHistory {
-	conditionHistoryCache.RLock()
-	history := conditionHistoryCache.histories[jiaIsuUUID]
-	conditionHistoryCache.RUnlock()
+func getOrCreateConditionHistory(state *ConditionState, jiaIsuUUID string) *ConditionHistory {
+	state.RLock()
+	history := state.histories[jiaIsuUUID]
+	state.RUnlock()
 	if history != nil {
 		return history
 	}
 
-	conditionHistoryCache.Lock()
-	defer conditionHistoryCache.Unlock()
-	history = conditionHistoryCache.histories[jiaIsuUUID]
+	state.Lock()
+	defer state.Unlock()
+	history = state.histories[jiaIsuUUID]
 	if history == nil {
 		history = &ConditionHistory{}
-		conditionHistoryCache.histories[jiaIsuUUID] = history
+		state.histories[jiaIsuUUID] = history
 	}
 	return history
 }
 
-func cacheConditionHistory(jiaIsuUUID string, conditions []CachedCondition) {
-	history := getOrCreateConditionHistory(jiaIsuUUID)
+func cacheConditionHistory(state *ConditionState, jiaIsuUUID string, conditions []CachedCondition) {
+	history := getOrCreateConditionHistory(state, jiaIsuUUID)
 	sort.SliceStable(conditions, func(i, j int) bool {
 		return conditions[i].Timestamp < conditions[j].Timestamp
 	})
@@ -520,11 +611,14 @@ func cacheConditionHistory(jiaIsuUUID string, conditions []CachedCondition) {
 	history.Unlock()
 }
 
-func conditionHistoryRange(jiaIsuUUID string, startTime, endTime time.Time) ([]CachedCondition, bool) {
-	conditionHistoryCache.RLock()
-	loaded := conditionHistoryCache.loaded
-	history := conditionHistoryCache.histories[jiaIsuUUID]
-	conditionHistoryCache.RUnlock()
+func conditionHistoryRange(state *ConditionState, jiaIsuUUID string, startTime, endTime time.Time) ([]CachedCondition, bool) {
+	if state == nil {
+		return nil, false
+	}
+	state.RLock()
+	loaded := state.loaded
+	history := state.histories[jiaIsuUUID]
+	state.RUnlock()
 	if !loaded {
 		return nil, false
 	}
@@ -786,25 +880,20 @@ func getIsuList(c echo.Context) error {
 	}
 
 	responseList := []GetIsuListResponse{}
-	latestConditions := snapshotLatestConditions()
+	state := currentConditionState()
+	latestConditions := snapshotLatestConditions(state)
 	for _, isu := range isuList {
 		var formattedCondition *GetIsuConditionResponse
 		latestCondition, ok := latestConditions[isu.JIAIsuUUID]
 		if ok {
-			conditionLevel, err := calculateConditionLevel(latestCondition.Condition)
-			if err != nil {
-				c.Logger().Error(err)
-				return c.NoContent(http.StatusInternalServerError)
-			}
-
 			formattedCondition = &GetIsuConditionResponse{
 				JIAIsuUUID:     isu.JIAIsuUUID,
 				IsuName:        isu.Name,
 				Timestamp:      latestCondition.Timestamp,
-				IsSitting:      latestCondition.IsSitting,
-				Condition:      latestCondition.Condition,
-				ConditionLevel: conditionLevel,
-				Message:        latestCondition.Message,
+				IsSitting:      cachedConditionIsSitting(latestCondition),
+				Condition:      cachedConditionString(latestCondition),
+				ConditionLevel: cachedConditionLevel(latestCondition),
+				Message:        conditionMessage(state, latestCondition.MessageID),
 			}
 		}
 
@@ -1080,7 +1169,8 @@ func generateIsuGraphResponse(db *sqlx.DB, jiaIsuUUID string, graphDate time.Tim
 	timestampsInThisHour := []int64{}
 	var startTimeInThisHour time.Time
 
-	conditions, loaded := conditionHistoryRange(jiaIsuUUID, graphDate, graphDate.Add(24*time.Hour))
+	state := currentConditionState()
+	conditions, loaded := conditionHistoryRange(state, jiaIsuUUID, graphDate, graphDate.Add(24*time.Hour))
 	if !loaded {
 		conditions = []CachedCondition{}
 		rows, err := db.Queryx(
@@ -1096,15 +1186,17 @@ func generateIsuGraphResponse(db *sqlx.DB, jiaIsuUUID string, graphDate time.Tim
 			if err = rows.StructScan(&condition); err != nil {
 				return nil, err
 			}
-			canonical, ok := canonicalConditionStrings[condition.Condition]
+			bits, ok := conditionBitsByString[condition.Condition]
 			if !ok {
 				return nil, fmt.Errorf("invalid condition: %q", condition.Condition)
 			}
+			flags := bits
+			if condition.IsSitting {
+				flags |= conditionFlagSitting
+			}
 			conditions = append(conditions, CachedCondition{
 				Timestamp: condition.Timestamp.Unix(),
-				Condition: canonical,
-				Message:   internConditionMessage(condition.Message),
-				IsSitting: condition.IsSitting,
+				Flags:     flags,
 			})
 		}
 	}
@@ -1199,23 +1291,24 @@ func generateIsuGraphResponse(db *sqlx.DB, jiaIsuUUID string, graphDate time.Tim
 
 // 複数のISUのコンディションからグラフの一つのデータ点を計算
 func calculateGraphDataPoint(isuConditions []CachedCondition) (GraphDataPoint, error) {
-	conditionsCount := map[string]int{"is_broken": 0, "is_dirty": 0, "is_overweight": 0}
+	isBrokenCount := 0
+	isDirtyCount := 0
+	isOverweightCount := 0
 	rawScore := 0
 	for _, condition := range isuConditions {
+		bits := cachedConditionBits(condition)
 		badConditionsCount := 0
-
-		if !isValidConditionFormat(condition.Condition) {
-			return GraphDataPoint{}, fmt.Errorf("invalid condition format")
+		if bits&1 != 0 {
+			isDirtyCount++
+			badConditionsCount++
 		}
-
-		for _, condStr := range strings.Split(condition.Condition, ",") {
-			keyValue := strings.Split(condStr, "=")
-
-			conditionName := keyValue[0]
-			if keyValue[1] == "true" {
-				conditionsCount[conditionName] += 1
-				badConditionsCount++
-			}
+		if bits&2 != 0 {
+			isOverweightCount++
+			badConditionsCount++
+		}
+		if bits&4 != 0 {
+			isBrokenCount++
+			badConditionsCount++
 		}
 
 		if badConditionsCount >= 3 {
@@ -1229,7 +1322,7 @@ func calculateGraphDataPoint(isuConditions []CachedCondition) (GraphDataPoint, e
 
 	sittingCount := 0
 	for _, condition := range isuConditions {
-		if condition.IsSitting {
+		if cachedConditionIsSitting(condition) {
 			sittingCount++
 		}
 	}
@@ -1239,9 +1332,9 @@ func calculateGraphDataPoint(isuConditions []CachedCondition) (GraphDataPoint, e
 	score := rawScore * 100 / 3 / isuConditionsLength
 
 	sittingPercentage := sittingCount * 100 / isuConditionsLength
-	isBrokenPercentage := conditionsCount["is_broken"] * 100 / isuConditionsLength
-	isOverweightPercentage := conditionsCount["is_overweight"] * 100 / isuConditionsLength
-	isDirtyPercentage := conditionsCount["is_dirty"] * 100 / isuConditionsLength
+	isBrokenPercentage := isBrokenCount * 100 / isuConditionsLength
+	isOverweightPercentage := isOverweightCount * 100 / isuConditionsLength
+	isDirtyPercentage := isDirtyCount * 100 / isuConditionsLength
 
 	dataPoint := GraphDataPoint{
 		Score: score,
@@ -1311,7 +1404,8 @@ func getIsuConditions(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	conditionsResponse, loaded, err := getIsuConditionsFromCache(jiaIsuUUID, endTime, conditionLevel, startTime, conditionLimit, isuName)
+	state := currentConditionState()
+	conditionsResponse, loaded, err := getIsuConditionsFromCache(state, jiaIsuUUID, endTime, conditionLevel, startTime, conditionLimit, isuName)
 	if err == nil && !loaded {
 		conditionsResponse, err = getIsuConditionsFromDB(db, jiaIsuUUID, endTime, conditionLevel, startTime, conditionLimit, isuName)
 	}
@@ -1322,12 +1416,15 @@ func getIsuConditions(c echo.Context) error {
 	return c.JSON(http.StatusOK, conditionsResponse)
 }
 
-func getIsuConditionsFromCache(jiaIsuUUID string, endTime time.Time, conditionLevel map[string]interface{}, startTime time.Time,
+func getIsuConditionsFromCache(state *ConditionState, jiaIsuUUID string, endTime time.Time, conditionLevel map[string]interface{}, startTime time.Time,
 	limit int, isuName string) ([]*GetIsuConditionResponse, bool, error) {
-	conditionHistoryCache.RLock()
-	loaded := conditionHistoryCache.loaded
-	history := conditionHistoryCache.histories[jiaIsuUUID]
-	conditionHistoryCache.RUnlock()
+	if state == nil {
+		return nil, false, nil
+	}
+	state.RLock()
+	loaded := state.loaded
+	history := state.histories[jiaIsuUUID]
+	state.RUnlock()
 	if !loaded {
 		return nil, false, nil
 	}
@@ -1335,21 +1432,23 @@ func getIsuConditionsFromCache(jiaIsuUUID string, endTime time.Time, conditionLe
 		return []*GetIsuConditionResponse{}, true, nil
 	}
 
-	allowedList := conditionStringsForLevels(conditionLevel)
-	allowed := make(map[string]struct{}, len(allowedList))
-	for _, condition := range allowedList {
-		allowed[condition] = struct{}{}
+	allowed := [8]bool{}
+	allowedCount := 0
+	for bits, level := range conditionLevelByBits {
+		if _, ok := conditionLevel[level]; ok {
+			allowed[bits] = true
+			allowedCount++
+		}
 	}
-	if len(allowed) == 0 {
+	if allowedCount == 0 {
 		return []*GetIsuConditionResponse{}, true, nil
 	}
 
-	response := make([]*GetIsuConditionResponse, 0, limit)
+	selected := make([]CachedCondition, 0, limit)
 	endUnix := endTime.Unix()
 	startUnix := startTime.Unix()
 	history.RLock()
-	defer history.RUnlock()
-	for i := len(history.conditions) - 1; i >= 0 && len(response) < limit; i-- {
+	for i := len(history.conditions) - 1; i >= 0 && len(selected) < limit; i-- {
 		condition := history.conditions[i]
 		if condition.Timestamp >= endUnix {
 			continue
@@ -1357,21 +1456,23 @@ func getIsuConditionsFromCache(jiaIsuUUID string, endTime time.Time, conditionLe
 		if !startTime.IsZero() && condition.Timestamp < startUnix {
 			break
 		}
-		if _, ok := allowed[condition.Condition]; !ok {
+		if !allowed[cachedConditionBits(condition)] {
 			continue
 		}
-		level, err := calculateConditionLevel(condition.Condition)
-		if err != nil {
-			continue
-		}
+		selected = append(selected, condition)
+	}
+	history.RUnlock()
+
+	response := make([]*GetIsuConditionResponse, 0, len(selected))
+	for _, condition := range selected {
 		response = append(response, &GetIsuConditionResponse{
 			JIAIsuUUID:     jiaIsuUUID,
 			IsuName:        isuName,
 			Timestamp:      condition.Timestamp,
-			IsSitting:      condition.IsSitting,
-			Condition:      condition.Condition,
-			ConditionLevel: level,
-			Message:        condition.Message,
+			IsSitting:      cachedConditionIsSitting(condition),
+			Condition:      cachedConditionString(condition),
+			ConditionLevel: cachedConditionLevel(condition),
+			Message:        conditionMessage(state, condition.MessageID),
 		})
 	}
 	return response, true, nil
@@ -1467,7 +1568,7 @@ func calculateConditionLevel(condition string) (string, error) {
 
 // GET /api/trend
 // ISUの性格毎の最新のコンディション情報
-func buildTrendResponse() ([]TrendResponse, error) {
+func buildTrendResponse(state *ConditionState) ([]TrendResponse, error) {
 	characterList := []Isu{}
 	err := db.Select(&characterList, "SELECT `character` FROM `isu` GROUP BY `character`")
 	if err != nil {
@@ -1494,7 +1595,7 @@ func buildTrendResponse() ([]TrendResponse, error) {
 		}
 	}
 	grouped := map[string]*groupedConditions{}
-	latestByUUID := snapshotLatestConditions()
+	latestByUUID := snapshotLatestConditions(state)
 	for _, row := range latestConditions {
 		if _, ok := grouped[row.Character]; !ok {
 			grouped[row.Character] = newGroupedConditions()
@@ -1503,12 +1604,8 @@ func buildTrendResponse() ([]TrendResponse, error) {
 		if !ok {
 			continue
 		}
-		conditionLevel, err := calculateConditionLevel(latestCondition.Condition)
-		if err != nil {
-			return nil, err
-		}
 		trendCondition := &TrendCondition{ID: row.ID, Timestamp: latestCondition.Timestamp}
-		switch conditionLevel {
+		switch cachedConditionLevel(latestCondition) {
 		case conditionLevelInfo:
 			grouped[row.Character].info = append(grouped[row.Character].info, trendCondition)
 		case conditionLevelWarning:
@@ -1548,28 +1645,29 @@ func buildTrendResponse() ([]TrendResponse, error) {
 
 func getTrend(c echo.Context) error {
 	now := time.Now()
-	trendCache.Lock()
-	if len(trendCache.body) != 0 && now.Before(trendCache.expiresAt) {
-		body := trendCache.body
-		trendCache.Unlock()
+	state := currentConditionState()
+	state.trendMu.Lock()
+	if len(state.trendBody) != 0 && now.Before(state.trendExpiresAt) {
+		body := state.trendBody
+		state.trendMu.Unlock()
 		return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, body)
 	}
 
-	res, err := buildTrendResponse()
+	res, err := buildTrendResponse(state)
 	if err != nil {
-		trendCache.Unlock()
+		state.trendMu.Unlock()
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
 	body, err := json.Marshal(res)
 	if err != nil {
-		trendCache.Unlock()
+		state.trendMu.Unlock()
 		c.Logger().Errorf("json error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
-	trendCache.body = body
-	trendCache.expiresAt = time.Now().Add(trendCacheTTL)
-	trendCache.Unlock()
+	state.trendBody = body
+	state.trendExpiresAt = time.Now().Add(trendCacheTTL)
+	state.trendMu.Unlock()
 
 	return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, body)
 }
@@ -1586,16 +1684,17 @@ func postIsuCondition(c echo.Context) error {
 	if err != nil {
 		return c.String(http.StatusBadRequest, "bad request body")
 	}
-	req := make([]CachedCondition, 0, bytes.Count(body, []byte("{")))
-	err = conditionJSON.Unmarshal(body, &req)
+	incoming := make([]IncomingCondition, 0, bytes.Count(body, []byte("{")))
+	err = conditionJSON.Unmarshal(body, &incoming)
 	if err != nil {
 		return c.String(http.StatusBadRequest, "bad request body")
-	} else if len(req) == 0 {
+	} else if len(incoming) == 0 {
 		return c.String(http.StatusBadRequest, "bad request body")
 	}
 
 	conditionWriteBarrier.RLock()
 	defer conditionWriteBarrier.RUnlock()
+	state := currentConditionState()
 
 	known, err := isKnownIsu(jiaIsuUUID)
 	if err != nil {
@@ -1606,19 +1705,31 @@ func postIsuCondition(c echo.Context) error {
 		return c.String(http.StatusNotFound, "not found: isu")
 	}
 
-	for i := range req {
-		canonical, ok := canonicalConditionStrings[req[i].Condition]
+	flags := make([]uint8, len(incoming))
+	for i := range incoming {
+		bits, ok := conditionBitsByString[incoming[i].Condition]
 		if !ok {
 			return c.String(http.StatusBadRequest, "bad request body")
 		}
-		req[i].Condition = canonical
-		req[i].Message = internConditionMessage(req[i].Message)
+		flags[i] = bits
+		if incoming[i].IsSitting {
+			flags[i] |= conditionFlagSitting
+		}
+	}
+
+	conditions := make([]CachedCondition, len(incoming))
+	for i := range incoming {
+		conditions[i] = CachedCondition{
+			Timestamp: incoming[i].Timestamp,
+			MessageID: internConditionMessage(state, incoming[i].Message),
+			Flags:     flags[i],
+		}
 	}
 
 	// During the one-minute scoring phase, the memory history is authoritative.
 	// initialize recreates it from the baseline DB, so per-request remote SQL is
 	// unnecessary and condition reads can observe the update immediately.
-	cacheConditionHistory(jiaIsuUUID, req)
+	cacheConditionHistory(state, jiaIsuUUID, conditions)
 
 	return c.NoContent(http.StatusAccepted)
 }
