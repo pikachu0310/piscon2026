@@ -249,6 +249,20 @@ work to move saturation downstream.
   score does not outweigh its best accepted-work total and lowest CPU per
   tracked success in this experiment family.
 
+### B24/B25: in-place private batch encoder (`1d1b602`)
+
+- Scores: B24 151,642; B25 152,634; both PASSED with deduction 0
+- Accepted work: B24 259,296 condition / 308,479 tracked successes; B25
+  **267,628 condition / 317,591 tracked successes**, new frontiers
+- Tail and overload: condition p99 155/157 ms; condition 499 80/223
+- Unit cost: total App CPU 54.24/57.08 seconds, approximately 0.176/0.180 ms
+  per tracked success versus B23's 0.183 ms
+- Allocation evidence: a fresh-process B24 profile is saved as
+  `runs/20260720T124923.123912Z-s1-8181c5/{s2,s3}/allocs.pprof` and text
+  summaries; it exposes the next private-response and synchronization costs
+- Decision: promote as the current overall capacity frontier. Continue from
+  it rather than selecting by scalar score alone.
+
 ## Decision rule
 
 Every run is judged on five axes:

@@ -390,6 +390,28 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   direct example where a 141k score run is stronger on accepted work and CPU
   efficiency than higher-scoring runs.
 
+### B24/B25 decision: direct batch encoding opens a new capacity tier
+
+- The edge previously encoded every request into a temporary private payload,
+  then copied all payloads into the final batch. The new two-pass encoder sizes
+  the complete batch and writes each request directly into that one buffer.
+  Byte-for-byte wire compatibility and race tests passed.
+- A 64-request microbenchmark moved from roughly 8.0 us, 20,480 B and 66
+  allocations to 4.2 us, 9,472 B and one allocation.
+- B24 scored 151,642 with 259,296 condition writes and 308,479 tracked
+  successes. B25 scored 152,634 with **267,628** condition writes and
+  **317,591** tracked successes. Both are new work frontiers, PASSED and
+  deduction 0; condition p99 was 155/157 ms.
+- B24 total App CPU was 54.24 seconds, lower than B23's 55.11 while accepting
+  6,495 more tracked successes. B25 used 57.08 seconds for another 9,112
+  successes. CPU per tracked success remained about 0.176/0.180 ms versus
+  B23's 0.183 ms.
+- A post-B24 allocation profile, taken after a fresh deploy and one official
+  run, is stored beside the run. It attributes 97 MB on s2 to the now-single
+  final batch buffer, but also reveals 736 MB cumulative allocation below the
+  private HTTP path, 84 MB in tiny response `ReadAll`, and 27 MB in per-request
+  result/channel state. These become the next isolated target.
+
 ## Four current-system maps
 
 ### Traffic
@@ -513,3 +535,12 @@ if their first official score is flat or lower.
   Its encoder currently allocates one temporary payload per request and then
   copies those payloads into a batch. Direct final-buffer encoding is the next
   isolated change.
+
+### 21:57 JST
+
+- B24/B25 promote commit `1d1b602`: accepted condition and total successful
+  work rose sharply in both runs while unit CPU cost improved.
+- Saved allocation profiles identify private-response buffering and
+  per-request synchronization objects as the next removable costs. Keep batch
+  worker count at eight for that experiment so transport concurrency is not
+  confounded with allocation removal.
