@@ -27,7 +27,8 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 | B5 | 19:20 | `f254b4c` | Compact generation-scoped condition state on the B3/B4 precompressed ingress | Heap proved 74% of retained memory was history; shrink each entry from 48 to 16 bytes and remove pointer scanning | portal `1d79911c-53b2-4613-8316-88e2b990697b`; artifact `20260720T102008.890588Z-s1-4fc66b` | **134,561**, PASSED, deduction 0 | New score champion and strong capacity frontier |
 | B6 | 19:27 | `6ee2209` | Keep compact state but restore B0 uncompressed client delivery | B5 freed App capacity but precompression reduced registration arrivals; feed the frontier with B0 ingress behavior | portal `43a8ea3f-ffec-4e5e-bc1e-bb547653308b`; artifact `20260720T102755.490389Z-s1-57d2f2` | **142,430**, PASSED, deduction 0 | New score champion; compact state converts to score when demand is restored |
 | B7 | 19:47 | `bb0d619` | Route only registration POSTs to a registration-only App colocated with MariaDB on s2 | Registration spends almost all wall time waiting for JIA while s2 is about 83% idle; isolate that wait from condition ownership on s3 | portal `58cf5dbc-634a-447e-bf6d-d3bb1829b98a`; artifact `20260720T104747.088972Z-s1-fd5739` | 134,195, PASSED, deduction 0 | Correct topology, not a work frontier on this run; repeat with both App profiles enabled |
-| B8 | 19:53 | `bb0d619` | Exact B7 repeat after enabling s2 CPU pprof and fgprof capture | Distinguish benchmark/JIA variance and measure the actual registration-only process | portal `14708ae4-ef0c-40c5-b62d-2bead6c3cf86`; artifact `20260720T105336.406228Z-s1-53128e` | 136,587, final result pending portal status refresh, deduction 0 in live log | Registration 201 exceeds B6, but condition 202 falls; retain as an isolation frontier, not score champion |
+| B8 | 19:53 | `bb0d619` | Exact B7 repeat after enabling s2 CPU pprof and fgprof capture | Distinguish benchmark/JIA variance and measure the actual registration-only process | portal `14708ae4-ef0c-40c5-b62d-2bead6c3cf86`; artifact `20260720T105336.406228Z-s1-53128e` | 136,587, PASSED, deduction 0 | Registration 201 exceeds B6, but condition 202 falls; retain as an isolation frontier, not score champion |
+| B9 | 20:07 | `9d025e4` | Terminate external condition bodies on s2 and synchronously forward a compact private format to authoritative state on s3 | B8 left s2 81% idle while s3 spent 5.27 CPU-seconds and about 2,700 goroutine-seconds in condition handling/body reads | portal `f8ee8044-c525-4eaa-9a3d-a9af2cf51953`; artifact `20260720T110736.312178Z-s1-18f414` | **160,102**, PASSED, deduction 6 | New score champion, but deliberately overloaded edge is not the condition-capacity frontier; fix registration placement and synchronous fan-out |
 
 ### B0 facts
 
@@ -139,6 +140,28 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   The next conversion attempt moves condition body/decode work to the same
   spare process while preserving the authoritative compact state on s3.
 
+### B9 decision: freeing reads raised score while write capacity fell
+
+- s2 reads and validates the original JSON condition body, replaces the long
+  canonical condition string with four flag bits, and sends a private binary
+  request to s3. s3 remains the only owner of histories, messages and trend;
+  all reads therefore retain immediate access to one authoritative generation.
+- Score rose 142,430 -> 160,102 (+12.4%). Read work increased materially:
+  trend 200 responses rose 24,421 -> 29,611 and condition reads 21,551 ->
+  23,270. The main App's CPU samples fell 32.26 -> 26.08 seconds.
+- This was not a general throughput win. Condition 202 fell 246,225 -> 100,209
+  while 499 rose 544 -> 117,143. Registration 201 fell 896 -> 692, with 779
+  registration 499s plus seven 500/502 responses. s2 became 67.7% busy and its
+  App sampled 53.31 CPU-seconds.
+- fgprof itself became expensive on the overloaded edge: profiling tens of
+  thousands of goroutines put 12.65 CPU-seconds under stack collection, while
+  condition JSON decode used 4.26 seconds and synchronous forwarding 5.40.
+- This is the concrete reason not to classify solely from a scalar score.
+  B9 is the score champion because the benchmark rewarded the read capacity it
+  unlocked, while B6 remains the stronger condition-ingest frontier. The next
+  isolated change routes registration back to the freed s3 App; after that,
+  balance or batch condition forwarding instead of accepting the 499 wall.
+
 ## Four current-system maps
 
 ### Traffic
@@ -198,11 +221,10 @@ slow client bodies occupy both the s1 proxy stream and an s3 Go HTTP connection.
    UUID to App workers on spare nodes and aggregate only global latest/metadata
    summaries. Do not use random load balancing.
 
-The next structural test is hypothesis 1. B7/B8 proved s2 can host an App with
-about 81% CPU idle, while s3 still spends roughly 2,700 goroutine-seconds in
-condition body reads and 5-6 CPU-seconds in the condition handler. Hypotheses 2
-and 3 remain capacity-frontier work even if their first official score is flat
-or lower.
+Hypothesis 1 produced B9's new score champion but overloaded s2 condition
+ingress. The immediate follow-ups are to move registration back to s3, then
+batch or balance the private condition hop. Hypotheses 2 and 3 remain
+capacity-frontier work even if their first official score is flat or lower.
 
 ## Hourly checkpoints
 

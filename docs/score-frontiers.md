@@ -2,20 +2,23 @@
 
 ## Score champion
 
-- Status: B6 validated
-- Commit: `6ee2209` (App source `f254b4c` plus B0-style Nginx delivery)
-- Topology declaration: s1=Nginx, s2=MariaDB, s3=Go App
-- Benchmark ID / score / validity: `43a8ea3f-ffec-4e5e-bc1e-bb547653308b`,
-  **142,430**, PASSED, deduction 0
-- Artifact: `20260720T102755.490389Z-s1-57d2f2`
-- Deployed app source provenance: `f254b4c`
-- B6 App binary SHA-256: `0c24a8b285540e7be86e95f1cc86728f743e98f8ab8b74513dff849dcbf2f72f`
+- Status: B9 validated
+- Commit: `9d025e4`
+- Topology declaration: s1=Nginx; s2=MariaDB plus registration/condition-edge
+  App; s3=authoritative compact-state/read App
+- Benchmark ID / score / validity: `f8ee8044-c525-4eaa-9a3d-a9af2cf51953`,
+  **160,102**, PASSED, deduction 6
+- Artifact: `20260720T110736.312178Z-s1-18f414`
+- Deployed app source provenance: `9d025e4`
+- B9 App binary SHA-256: `359b5e431fcbd8dccd731961683e626401affe4d8b4f70e6ad4267d15435fc1c`
 - B6 Nginx main SHA-256: `10cb2bce3bb674077c960f0a3910972d7184b97cec111669e40dab64514328b9`
-- B6 Nginx site SHA-256: `9ad5ce44a6e0417c104b8db6605a08c64a2a9ec6debd59a0b30a818b432e81af`
-- B6 topology SHA-256: `d399071c8ed066d29ce9e942d3a604cd823b6c1151bb885c89c76fe4987fbc24`
+- B9 Nginx site SHA-256: `9f43aefdb8ad8fa74bfac64a49ec0c3576daa5b47bcc48596b2a5ca2c7c122fe`
+- B9 s2 drop-in SHA-256: `6e679970dfebd88caa4c69010016e8a7479baebe18913e1927d255d6fd3e0c23`
+- B9 s3 drop-in SHA-256: `5b779468eb28ee1738127950bf3609a39cf59f5456c8b15afacc6ebe6843b61c`
 - s2 MariaDB tuning SHA-256: `b7462f1f41615fa7a733871d2aed3969973708e02497d0f5526e8e4e10ea31af`
-- B0 remains fully restorable from the earlier manifest and the server-side
-  `/home/isucon/score-champion-b0` config backup.
+- B9 is backed up server-side under `/home/isucon/score-champion-b9`. B6 remains
+  fully restorable under `/home/isucon/score-champion-b6`; B0 remains under
+  `/home/isucon/score-champion-b0`.
 
 ## Capacity frontier
 
@@ -78,6 +81,18 @@
 - Decision: retain as an isolation/capacity branch. It has not yet proven more
   total accepted work or a higher score. Try to convert the spare-node topology
   by offloading condition ingress/decode while keeping B6 fully restorable.
+
+### B9: compact condition edge on s2 (`9d025e4`)
+
+- Score: 160,102, PASSED, deduction 6 (new score champion)
+- Read capacity: trend 200 +21.3%; condition-read 200 +8.0% versus B6
+- Write capacity: condition 202 -59.3%; condition 499 544 -> 117,143;
+  registration 201 -22.8%
+- Resource shift: s3 CPU samples fell 32.26 -> 26.08 seconds, while s2 App
+  reached 53.31 seconds and s2 host became 67.7% busy
+- Decision: score champion and proof that read-path isolation matters, but not
+  a total-work frontier. Preserve B6 separately as the condition-ingest
+  frontier and reduce edge synchronization/profiling cost in follow-ups.
 
 ## Decision rule
 
