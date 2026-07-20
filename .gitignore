@@ -1,3 +1,4 @@
 /measurements/
+/.state/
 *.private.json
 *.private.log
