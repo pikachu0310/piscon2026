@@ -1,5 +1,11 @@
 # Score and capacity frontiers
 
+These are intentionally separate. The scalar score answers “what did this
+benchmark reward?”, while the capacity frontier answers “how much valid work
+did the system complete, with what failures and resource cost?”. A change can
+improve the latter and temporarily lower the former by admitting enough extra
+work to move saturation downstream.
+
 ## Score champion
 
 - Status: B9 validated
@@ -104,9 +110,35 @@
 - Decision: current total-work/correctness frontier. Keep B9 as score champion;
   use B10 as the base for compact-hop batching and load balancing.
 
+### B11: batched compact condition hop (`3f0fc62`)
+
+- Score: 156,224, PASSED, deduction 0 (2.4% below B9)
+- Accepted work: 241,858 condition 202 and 936 registration 201; condition 202
+  is 2.41x B9 and 2.18x B10
+- Failures: condition 499 fell 118,419 -> 7,334 from B10; registration had four
+  499s and no 500/502
+- Read work: 26,025 trend 200 and 23,440 condition-read 200, preserving most of
+  B9's score-producing read capacity
+- Unit cost: edge App CPU 52.98 -> 41.16 seconds; authoritative App CPU 30.38
+  -> 21.85 seconds; total sampled App CPU -24.4% while accepted condition work
+  more than doubled. Edge CPU per condition 202 is about 0.170 ms, down 64.4%
+  from B10.
+- Decision: **current overall capacity/correctness champion** and the base for
+  further experiments. B9 remains separately restorable as scalar champion.
+
 ## Decision rule
 
-The score champion is always restorable and is the final-mode candidate. A
+Every run is judged on five axes:
+
+1. official score and validity/deduction;
+2. successful work by request family, not only the grand total;
+3. overload/correctness failures, especially 499 versus 5xx and deductions;
+4. resource cost per accepted unit and the node where saturation moved; and
+5. read/write latency and whether newly admitted work created downstream load.
+
+The score champion is always restorable and remains a final-mode candidate. A
 capacity frontier is kept on its own commit/config while up to three downstream
 experiments (five for a structural change with at least 20% more valid work)
-attempt to convert capacity into official score.
+attempt to convert capacity into official score. A lower score alone never
+causes rollback when accepted work, correctness, or unit cost materially
+improves.

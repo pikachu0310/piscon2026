@@ -30,6 +30,7 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 | B8 | 19:53 | `bb0d619` | Exact B7 repeat after enabling s2 CPU pprof and fgprof capture | Distinguish benchmark/JIA variance and measure the actual registration-only process | portal `14708ae4-ef0c-40c5-b62d-2bead6c3cf86`; artifact `20260720T105336.406228Z-s1-53128e` | 136,587, PASSED, deduction 0 | Registration 201 exceeds B6, but condition 202 falls; retain as an isolation frontier, not score champion |
 | B9 | 20:07 | `9d025e4` | Terminate external condition bodies on s2 and synchronously forward a compact private format to authoritative state on s3 | B8 left s2 81% idle while s3 spent 5.27 CPU-seconds and about 2,700 goroutine-seconds in condition handling/body reads | portal `f8ee8044-c525-4eaa-9a3d-a9af2cf51953`; artifact `20260720T110736.312178Z-s1-18f414` | **160,102**, PASSED, deduction 6 | New score champion, but deliberately overloaded edge is not the condition-capacity frontier; fix registration placement and synchronous fan-out |
 | B10 | 20:13 | `e8d6467` | Keep the condition edge on s2 but route registration back to newly freed s3 | B9 colocated registration with the saturated edge and produced 779 registration 499s plus seven 500/502 responses | portal `40713158-859f-4ba4-a1bb-dc2cb68def5d`; artifact `20260720T111323.749645Z-s1-816101` | 147,446, PASSED, deduction 0 | Stronger total-work/correctness frontier: 999 registrations and more condition 202, but less read work than B9; batch the private hop next |
+| B11 | 20:20 | `3f0fc62` | Keep B10 routing and batch up to 64 already-queued compact condition updates behind eight edge workers | B10 spent 52.98 edge CPU-seconds while synchronously forwarding each accepted body and returned about 118k condition 499s | portal `cf2f1369-52fb-43a3-9965-26b1fcc7cf24`; artifact `20260720T112047.518093Z-s1-cc4808` | **156,224**, PASSED, deduction 0 | New overall capacity/correctness champion: near-score-champion result while accepting 2.41x B9 condition writes at much lower CPU cost |
 
 ### B0 facts
 
@@ -179,15 +180,37 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   internal workers. It does not delay lightly loaded requests; it only merges
   work already queued under pressure.
 
+### B11 decision: batching converted spare-node isolation into real capacity
+
+- Official score reached 156,224, only 2.4% below B9's scalar champion, with
+  deduction 0. The final 38 score points lost to 383 timed-out checks are kept
+  separate from correctness deductions.
+- Accepted condition writes rose from 100,209 in B9 and 110,927 in B10 to
+  **241,858**: 2.41x B9 and 2.18x B10. Condition 499 fell from 118,419 in B10
+  to 7,334. Registration remained healthy at 936 HTTP 201 responses, with only
+  four registration 499s and no registration 500/502.
+- The work increase did not come from spending more CPU. Edge App CPU samples
+  fell 52.98 -> 41.16 seconds and authoritative App CPU fell 30.38 -> 21.85
+  seconds. Total sampled App CPU fell 83.36 -> 63.01 seconds (-24.4%) while
+  accepted condition writes more than doubled. Edge CPU per accepted condition
+  fell from about 0.478 ms to 0.170 ms (-64.4%).
+- Successful reads also remained substantial: 26,025 trend reads and 23,440
+  condition reads, versus B9's 29,611 and 23,270. B11 therefore is not merely
+  shifting all resources from reads to writes; it is the strongest balanced
+  result so far.
+- This run demonstrates why a lower score is not automatically a regression.
+  B9 remains the scalar score champion at 160,102, while B11 is promoted to the
+  overall capacity/correctness champion and the base for subsequent work.
+
 ## Four current-system maps
 
 ### Traffic
 
-The live experiment is `benchmark -> s1 Nginx/TLS`, with `POST /api/isu`
-routed to a registration-only App on s2 and every other API routed to the
-authoritative App on s3. Both use MariaDB on s2. Static pages and assets
-terminate on s1. Condition uploads still use `proxy_request_buffering off`, so
-slow client bodies occupy both the s1 proxy stream and an s3 Go HTTP connection.
+The live B11 experiment is `benchmark -> s1 Nginx/TLS`. Condition POST bodies
+terminate at the edge App on s2, where they are decoded and converted to a
+compact private format. Up to 64 already-queued updates share one request to
+the authoritative App on s3. Registration and every public read execute on s3;
+both Apps use MariaDB on s2. Static pages and assets terminate on s1.
 
 ### State ownership
 
@@ -221,10 +244,9 @@ slow client bodies occupy both the s1 proxy stream and an s3 Go HTTP connection.
 
 ## Current hypothesis queue
 
-1. **Decode condition bodies on the spare s2 App.** Route only condition POST
-   to s2, validate there, and forward a compact private representation to s3.
-   Keep all reads and the authoritative generation state on s3. Compare total
-   202 work, 499, per-node CPU, and s3 HTTP/decode cost before batching.
+1. **Balance condition ingress between s2 and s3.** B11 made the compact edge
+   efficient, but s2 is still the busiest App node. Test a stable traffic split
+   while every path continues to update the authoritative state on s3.
 2. **Build an initialize-time `IsuRegistry`.** Replace owner/name/list/id/
    character metadata SQL with immutable memory indexes, publishing a new ISU
    only after JIA success and DB commit.
@@ -238,11 +260,23 @@ slow client bodies occupy both the s1 proxy stream and an s3 Go HTTP connection.
    UUID to App workers on spare nodes and aggregate only global latest/metadata
    summaries. Do not use random load balancing.
 
-Hypothesis 1 produced B9's new score champion but overloaded s2 condition
-ingress. The immediate follow-ups are to move registration back to s3, then
-batch or balance the private condition hop. Hypotheses 2 and 3 remain
-capacity-frontier work even if their first official score is flat or lower.
+The compact condition-edge family produced B9's score champion, B10's
+registration recovery, and B11's overall capacity champion. B11 resolves the
+per-request private-hop fan-out; the next isolated topology test balances the
+remaining edge pressure. Hypotheses 2 and 3 remain capacity-frontier work even
+if their first official score is flat or lower.
 
 ## Hourly checkpoints
 
-Pending.
+### 20:21 JST
+
+- Scalar score champion: B9, 160,102. It favors successful reads while shedding
+  most offered condition writes, so it is not treated as the best system in
+  every dimension.
+- Capacity/correctness champion: B11, 156,224. It accepts 241,858 condition
+  writes, 936 registrations, 26,025 trend reads and 23,440 condition reads with
+  no correctness deduction.
+- Evaluation rule from this point: track score, accepted work mix, failure
+  classes, tail latency, and resource cost together. A score drop accompanied
+  by more valid downstream work or lower unit cost remains a retained frontier;
+  it receives follow-up experiments rather than an automatic rollback.
