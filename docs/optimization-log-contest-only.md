@@ -430,6 +430,25 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   143 MB full-history/latest snapshot plus 19.5 MB metadata snapshot used by
   list/trend reads.
 
+### B28/B29 decision: select latest values without whole-state snapshots
+
+- List reads now lock and inspect only their requested histories. Trend holds
+  the registry/state read locks while selecting existing history tails instead
+  of copying every registry row and two complete maps. Out-of-order ingest and
+  race tests preserve latest-value semantics.
+- For 512 histories, the isolated old snapshot cost about 36 us, 68 KB and
+  seven allocations; protected direct selection cost about 7.6 us with zero
+  bytes and zero allocations.
+- B28 scored 150,609 with 305,194 tracked successes and 52.26 App CPU seconds,
+  establishing the new unit-cost frontier at about **0.171 ms/success**. Read
+  success rose 915 versus B26 and registration success rose 19.
+- B29 scored 147,456 under a much lower 295,049-success offered trajectory.
+  Its whole-run unit cost was 0.181 ms, but the removed snapshot functions
+  stayed absent, trend-build CPU was 0.35 seconds, and combined `mallocgc`
+  fell to **5.90 seconds** versus 6.39 in B28 and 6.53/6.91 in B26/B27.
+- Promote direct latest selection. B29's lower offered work changes the global
+  ratio but does not bring back the measured allocation wall.
+
 ## Four current-system maps
 
 ### Traffic
@@ -570,3 +589,11 @@ if their first official score is flat or lower.
 - List/trend currently copy every history and registry trend row before
   selecting latest values. Replace those snapshots with protected direct
   lookups, keeping response ordering and registry/state ownership unchanged.
+
+### 22:19 JST
+
+- B28/B29 promote commit `ff2ef02`; B28 sets the best measured CPU per tracked
+  success, and both profiles remove the 143 MB snapshot site.
+- Authoritative private-batch body `ReadAll` allocated 283 MB in the fresh B24
+  profile. Pool the bounded binary body next; prove decoded UUID/message strings
+  do not alias the returned buffer before deployment.

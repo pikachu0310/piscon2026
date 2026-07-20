@@ -274,6 +274,18 @@ work to move saturation downstream.
 - Decision: retain as the unit-cost frontier. Offered load was below B25, so
   the lower scalar scores do not justify restoring measured allocation waste.
 
+### B28/B29: direct latest-condition reads (`ff2ef02`)
+
+- Scores: B28 150,609; B29 147,456; both PASSED with deduction 0
+- B28 work/cost: 305,194 tracked successes in 52.26 App CPU seconds, the best
+  measured unit cost at approximately **0.171 ms/success**
+- B29 workload: 295,049 tracked successes; despite the lower offered work,
+  combined `mallocgc` fell to 5.90 seconds and trend-build CPU to 0.35 seconds
+- Allocation proof: 512-history microbenchmark changed from about 36 us,
+  68 KB and seven allocations to 7.6 us, zero bytes and zero allocations
+- Decision: promote as read/unit-cost frontier. B28 is the comparable capacity
+  point; B29 verifies the removed snapshot does not return under another mix.
+
 ## Decision rule
 
 Every run is judged on five axes:
