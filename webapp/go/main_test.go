@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -229,6 +230,13 @@ func TestForwardedConditionBatchCodecRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	referenceBody, err := encodeForwardedConditionBatchReference(requests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, referenceBody) {
+		t.Fatal("direct batch encoding changed the wire format")
+	}
 	uuids, conditions, err := decodeForwardedConditionBatch(body)
 	if err != nil {
 		t.Fatal(err)
@@ -254,6 +262,33 @@ func TestForwardedConditionBatchCodecRoundTrip(t *testing.T) {
 	if !reflect.DeepEqual(gotStatuses, wantStatuses) {
 		t.Fatalf("statuses = %#v, want %#v", gotStatuses, wantStatuses)
 	}
+}
+
+func encodeForwardedConditionBatchReference(requests []*conditionForwardRequest) ([]byte, error) {
+	if len(requests) == 0 || len(requests) > int(^uint16(0)) {
+		return nil, fmt.Errorf("invalid forwarded batch size")
+	}
+	payloads := make([][]byte, len(requests))
+	size := 6
+	for index := range requests {
+		payload, err := encodeForwardedConditions(requests[index].jiaIsuUUID, requests[index].conditions)
+		if err != nil {
+			return nil, err
+		}
+		payloads[index] = payload
+		size += 4 + len(payload)
+	}
+	body := make([]byte, size)
+	copy(body, "ICB1")
+	binary.LittleEndian.PutUint16(body[4:], uint16(len(payloads)))
+	offset := 6
+	for index := range payloads {
+		binary.LittleEndian.PutUint32(body[offset:], uint32(len(payloads[index])))
+		offset += 4
+		copy(body[offset:], payloads[index])
+		offset += len(payloads[index])
+	}
+	return body, nil
 }
 
 func TestForwardedConditionBatchCodecRejectsCorruption(t *testing.T) {
@@ -461,6 +496,41 @@ func BenchmarkConditionRequestPooled(b *testing.B) {
 			b.Fatal(err)
 		} else {
 			releaseConditionRequestBuffer(pooled)
+		}
+	}
+}
+
+var benchmarkForwardRequests = func() []*conditionForwardRequest {
+	requests := make([]*conditionForwardRequest, 64)
+	conditions := []ForwardedCondition{
+		{Timestamp: 1620000000, Message: "normal message", Flags: 10},
+		{Timestamp: 1620000001, Message: "日本語 message", Flags: 5},
+		{Timestamp: 1620000002, Message: "third", Flags: 8},
+		{Timestamp: 1620000003, Message: "fourth", Flags: 7},
+	}
+	for index := range requests {
+		requests[index] = &conditionForwardRequest{
+			jiaIsuUUID: fmt.Sprintf("%08d-89ab-cdef-0123-456789abcdef", index),
+			conditions: conditions,
+		}
+	}
+	return requests
+}()
+
+func BenchmarkForwardBatchEncoderReference(b *testing.B) {
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		if _, err := encodeForwardedConditionBatchReference(benchmarkForwardRequests); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkForwardBatchEncoderDirect(b *testing.B) {
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		if _, err := encodeForwardedConditionBatch(benchmarkForwardRequests); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

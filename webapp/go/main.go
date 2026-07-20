@@ -1061,20 +1061,26 @@ func releaseConditionRequestBuffer(buffer *conditionRequestBuffer) {
 	}
 }
 
-func encodeForwardedConditions(jiaIsuUUID string, conditions []ForwardedCondition) ([]byte, error) {
+func forwardedConditionsEncodedSize(jiaIsuUUID string, conditions []ForwardedCondition) (int, error) {
 	if len(jiaIsuUUID) > int(^uint16(0)) || uint64(len(conditions)) > uint64(^uint32(0)) {
-		return nil, fmt.Errorf("condition batch is too large")
+		return 0, fmt.Errorf("condition batch is too large")
 	}
-	size := 4 + 2 + len(jiaIsuUUID) + 4
+	size := uint64(4 + 2 + len(jiaIsuUUID) + 4)
 	for index := range conditions {
 		if uint64(len(conditions[index].Message)) > uint64(^uint32(0)) {
-			return nil, fmt.Errorf("condition message is too large")
+			return 0, fmt.Errorf("condition message is too large")
 		}
-		size += 8 + 1 + 4 + len(conditions[index].Message)
+		size += 8 + 1 + 4 + uint64(len(conditions[index].Message))
 	}
-	body := make([]byte, size)
-	copy(body, "ICD1")
-	offset := 4
+	if size > uint64(^uint(0)>>1) {
+		return 0, fmt.Errorf("condition batch is too large")
+	}
+	return int(size), nil
+}
+
+func writeForwardedConditions(body []byte, offset int, jiaIsuUUID string, conditions []ForwardedCondition) int {
+	copy(body[offset:], "ICD1")
+	offset += 4
 	binary.LittleEndian.PutUint16(body[offset:], uint16(len(jiaIsuUUID)))
 	offset += 2
 	copy(body[offset:], jiaIsuUUID)
@@ -1091,6 +1097,16 @@ func encodeForwardedConditions(jiaIsuUUID string, conditions []ForwardedConditio
 		copy(body[offset:], conditions[index].Message)
 		offset += len(conditions[index].Message)
 	}
+	return offset
+}
+
+func encodeForwardedConditions(jiaIsuUUID string, conditions []ForwardedCondition) ([]byte, error) {
+	size, err := forwardedConditionsEncodedSize(jiaIsuUUID, conditions)
+	if err != nil {
+		return nil, err
+	}
+	body := make([]byte, size)
+	writeForwardedConditions(body, 0, jiaIsuUUID, conditions)
 	return body, nil
 }
 
@@ -1138,28 +1154,29 @@ func encodeForwardedConditionBatch(requests []*conditionForwardRequest) ([]byte,
 	if len(requests) == 0 || len(requests) > int(^uint16(0)) {
 		return nil, fmt.Errorf("invalid forwarded batch size")
 	}
-	payloads := make([][]byte, len(requests))
-	size := 4 + 2
+	size := uint64(4 + 2)
 	for index := range requests {
-		payload, err := encodeForwardedConditions(requests[index].jiaIsuUUID, requests[index].conditions)
+		payloadSize, err := forwardedConditionsEncodedSize(requests[index].jiaIsuUUID, requests[index].conditions)
 		if err != nil {
 			return nil, err
 		}
-		if uint64(len(payload)) > uint64(^uint32(0)) {
+		if uint64(payloadSize) > uint64(^uint32(0)) {
 			return nil, fmt.Errorf("forwarded payload is too large")
 		}
-		payloads[index] = payload
-		size += 4 + len(payload)
+		size += 4 + uint64(payloadSize)
 	}
-	body := make([]byte, size)
+	if size > uint64(^uint(0)>>1) {
+		return nil, fmt.Errorf("forwarded batch is too large")
+	}
+	body := make([]byte, int(size))
 	copy(body, "ICB1")
-	binary.LittleEndian.PutUint16(body[4:], uint16(len(payloads)))
+	binary.LittleEndian.PutUint16(body[4:], uint16(len(requests)))
 	offset := 6
-	for index := range payloads {
-		binary.LittleEndian.PutUint32(body[offset:], uint32(len(payloads[index])))
+	for index := range requests {
+		payloadSize, _ := forwardedConditionsEncodedSize(requests[index].jiaIsuUUID, requests[index].conditions)
+		binary.LittleEndian.PutUint32(body[offset:], uint32(payloadSize))
 		offset += 4
-		copy(body[offset:], payloads[index])
-		offset += len(payloads[index])
+		offset = writeForwardedConditions(body, offset, requests[index].jiaIsuUUID, requests[index].conditions)
 	}
 	return body, nil
 }
