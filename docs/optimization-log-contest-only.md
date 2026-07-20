@@ -34,6 +34,7 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 | B12 | 20:34 | `eeafca4` intent, B11 effective | Intended 3:1 split of condition ingress across s2 and s3 | Validate deployment from captured `upstream_addr`, not only repository diff and `nginx -t` | portal `dd5e2228-86d9-496a-afa1-6416f3bce7ed`; artifact `20260720T113448.928674Z-s1-0e9c09` | **151,449**, PASSED, deduction 0 | Valid B11 repeat and new condition-ingest count frontier; not a split experiment because all 261,883 condition attempts still reached s2 |
 | B13 | 20:42 | `eeafca4` effective | Send condition POSTs 3:1 to the batched s2 edge and directly to authoritative s3 | B11/B12 left edge CPU above authoritative CPU; every route still updates the sole s3 generation | portal `04b6a6bd-0294-474c-9424-37a5c0603e9a`; artifact `20260720T114250.931832Z-s1-c1eddf` | **162,980**, PASSED, deduction 0 | New scalar, condition-ingest, and balanced-capacity champion; test 2:1 to close the remaining CPU gap |
 | B14 | 20:49 | `aa78bde` | Change condition ingress from 3:1 to 2:1 edge:direct | B13 App CPU samples were 36.31s on s2 and 29.26s on s3 | portal `fd30ddd0-6e24-4eb7-8187-44779e45b15c`; artifact `20260720T114923.209743Z-s1-f2e80d` | **144,824**, PASSED, deduction 0 | CPU-balance and low-overload frontier, not an automatic regression; offered condition load was 11.6% lower, so repeat exactly |
+| B15 | 20:53 | `aa78bde` | Exact repeat of the 2:1 edge:direct split | Separate ratio behavior from B14's offered-load trajectory | portal `fe92aa0a-306f-4300-b958-cc61bea2c383`; artifact `20260720T115346.002992Z-s1-8fcb16` | **150,001**, PASSED, deduction 0 | Confirms a stable CPU-balance/low-failure frontier; use it as the isolation base for the metadata registry |
 
 ### B0 facts
 
@@ -259,6 +260,20 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 - Total App CPU per accepted condition was approximately flat versus B13
   (0.237 ms versus 0.234 ms). Repeat the exact 2:1 configuration in B15 to
   distinguish ratio behavior from benchmark demand variance.
+
+### B15 decision: the 2:1 capacity behavior is reproducible
+
+- B15 repeated 250,902 condition 202, 945 registration 201, 26,245 trend reads
+  and 22,517 condition reads. These are very close to B14's 250,251, 948,
+  26,206 and 22,288 despite a different official score of 150,001.
+- Condition 499 fell even further from 516 to **133**. s2/s3 App CPU samples
+  repeated at 30.65/28.68 seconds versus B14's 30.69/28.71. This is strong
+  evidence that 2:1 reliably balances compute and admits almost every offered
+  condition request.
+- B13's 3:1 remains the score and peak-ingest champion; B14/B15 establish 2:1
+  as the stable low-overload frontier. The next structural family uses 2:1 as
+  an isolation base: replace repeated public-read metadata SELECTs with an
+  initialize-time registry, then combine a proven win with the B13 ratio.
 
 ## Four current-system maps
 

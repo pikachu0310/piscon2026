@@ -160,6 +160,17 @@ work to move saturation downstream.
   condition traffic was 11.6% lower, run an exact repeat before selecting the
   production ratio.
 
+### B15: exact 2:1 repeat (`aa78bde`)
+
+- Score: 150,001, PASSED, deduction 0
+- Accepted work: 250,902 condition 202, 945 registration 201, 26,245 trend 200
+  and 22,517 condition-read 200
+- Failures: only 133 condition 499 and no condition 5xx
+- Resource balance: s2/s3 App CPU 30.65/28.68 seconds, effectively identical
+  to B14's 30.69/28.71
+- Decision: 2:1 is a reproducible CPU-balance/low-overload frontier. Keep B13's
+  3:1 as score/peak-ingest champion and use 2:1 to isolate the next code change.
+
 ## Decision rule
 
 Every run is judged on five axes:
