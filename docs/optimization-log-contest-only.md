@@ -24,6 +24,7 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 | B2 | 18:50 | `367dd65` | Runtime-gzip the large client bundle on s1 | B0 transferred 979 MiB of vendor JS; compressed body is 211 KiB instead of 743 KiB | portal `78ca02d5-1e8d-456b-ac82-7d8e8a9240e1`; artifact `20260720T095009.878600Z-s1-4a0475` | 127,939, PASSED, deduction 0 | Mechanism valid, implementation rejected: runtime compression saturated ingress CPU |
 | B3 | 18:55 | `da4fd9a` | Precompress immutable assets and serve with `gzip_static` | Same wire reduction as B2 without runtime compression | portal `af7892ca-48a7-4925-8247-dd5103111a1b`; artifact `20260720T095553.416750Z-s1-92e3b8` | 125,165, PASSED, deduction 0 | Capacity-frontier candidate; repeat before decision |
 | B4 | 18:59 | `da4fd9a` | Exact repeat of B3 | Separate benchmark variance from static-compression mechanism | portal `926d9431-620d-4454-853d-4096d56eedba`; artifact `20260720T095959.518837Z-s1-a49d6d` | 128,296, PASSED, deduction 0 | Capacity frontier confirmed; not score champion |
+| B5 | 19:20 | `f254b4c` | Compact generation-scoped condition state on the B3/B4 precompressed ingress | Heap proved 74% of retained memory was history; shrink each entry from 48 to 16 bytes and remove pointer scanning | portal `1d79911c-53b2-4613-8316-88e2b990697b`; artifact `20260720T102008.890588Z-s1-4fc66b` | **134,561**, PASSED, deduction 0 | New score champion and strong capacity frontier |
 
 ### B0 facts
 
@@ -89,6 +90,20 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   of which 142.4 MiB (74.3%) was `cacheConditionHistory` backing storage and
   29.2 MiB was live `io.ReadAll` body buffers. The next structural family is a
   compact generation-scoped condition representation plus streaming decode.
+
+### B5 decision: compact state removed the GC/memory wall
+
+- The internal condition entry is now 16 bytes: timestamp, message ID and four
+  flag bits. Canonical strings and messages live once in generation-owned
+  tables. Histories, message table and trend cache swap together at initialize.
+- In-use heap fell 191.7 -> 73.5 MiB (-61.7%). History backing storage fell
+  142.4 -> 42.2 MiB (-70.4%). CPU samples fell 37.03 -> 27.88 seconds
+  (-24.7%), `scanobject` 3.28 -> 1.28 seconds and `mallocgc` 4.90 -> 3.07.
+- Condition 499 fell 3,073 -> 71. Official score reached 134,561, narrowly
+  above B0, even though condition 202 and registration counts were lower.
+- This is both score champion and a much stronger capacity platform. B6 removes
+  precompression while keeping compact state to feed the saved capacity with
+  the B0 client-arrival behavior.
 
 ## Four current-system maps
 
