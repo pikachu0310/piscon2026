@@ -273,3 +273,36 @@ func TestForwardedConditionBatchCodecRejectsCorruption(t *testing.T) {
 		t.Fatal("wrong expected status count was accepted")
 	}
 }
+
+func TestIsuRegistryIndexesAndPublishesRegistration(t *testing.T) {
+	registry := buildIsuRegistry([]Isu{
+		{ID: 3, JIAIsuUUID: "isu-3", Name: "third", Character: "zeta", JIAUserID: "user-a"},
+		{ID: 1, JIAIsuUUID: "isu-1", Name: "first", Character: "alpha", JIAUserID: "user-a"},
+		{ID: 2, JIAIsuUUID: "isu-2", Name: "second", Character: "zeta", JIAUserID: "user-b"},
+	})
+
+	list := registry.listForUser("user-a")
+	if got := []int{list[0].ID, list[1].ID}; !reflect.DeepEqual(got, []int{3, 1}) {
+		t.Fatalf("list order = %v, want newest ID first", got)
+	}
+	if _, ok := registry.get("user-b", "isu-2"); !ok {
+		t.Fatal("owner lookup missed an existing ISU")
+	}
+	if _, ok := registry.get("user-a", "isu-2"); ok {
+		t.Fatal("owner lookup crossed user boundary")
+	}
+	characters, rows := registry.trendSnapshot()
+	if !reflect.DeepEqual(characters, []string{"alpha", "zeta"}) || len(rows) != 3 {
+		t.Fatalf("trend snapshot = characters %v, rows %d", characters, len(rows))
+	}
+
+	registry.add(Isu{ID: 4, JIAIsuUUID: "isu-4", Name: "fourth", Character: "beta", JIAUserID: "user-a"})
+	list = registry.listForUser("user-a")
+	if got := []int{list[0].ID, list[1].ID, list[2].ID}; !reflect.DeepEqual(got, []int{4, 3, 1}) {
+		t.Fatalf("list after registration = %v", got)
+	}
+	characters, rows = registry.trendSnapshot()
+	if !reflect.DeepEqual(characters, []string{"alpha", "beta", "zeta"}) || len(rows) != 4 {
+		t.Fatalf("trend snapshot after registration = characters %v, rows %d", characters, len(rows))
+	}
+}

@@ -81,6 +81,7 @@ var (
 
 	isuRegistrationLocks sync.Map
 	knownIsuLookupLocks  [64]sync.Mutex
+	isuRegistry          atomic.Value // *IsuRegistry; replaced after initialize
 
 	registrationRequests = newRegistrationRequestGate()
 
@@ -330,6 +331,18 @@ type IsuListQueryRow struct {
 	Character  string `db:"character"`
 }
 
+// IsuRegistry is the read-side view of the durable ISU metadata. MariaDB
+// remains authoritative, but public reads use this generation-local index
+// instead of issuing the same small SELECT tens of thousands of times.
+type IsuRegistry struct {
+	sync.RWMutex
+	byUser         map[string][]IsuListQueryRow
+	byUserUUID     map[string]Isu
+	trendRows      []TrendQueryRow
+	characters     []string
+	characterKnown map[string]struct{}
+}
+
 type JIAServiceRequest struct {
 	TargetBaseURL string `json:"target_base_url"`
 	IsuUUID       string `json:"isu_uuid"`
@@ -442,6 +455,10 @@ func main() {
 			e.Logger.Fatalf("failed to load condition histories: %v", err)
 			return
 		}
+		if err = reloadIsuRegistry(); err != nil {
+			e.Logger.Fatalf("failed to load ISU registry: %v", err)
+			return
+		}
 	}
 	defer db.Close()
 	startDiagnosticsServer(e.Logger)
@@ -523,6 +540,112 @@ func reloadKnownIsus() error {
 	knownIsuCache.loaded = true
 	knownIsuCache.Unlock()
 	return nil
+}
+
+func buildIsuRegistry(isus []Isu) *IsuRegistry {
+	registry := &IsuRegistry{
+		byUser:         make(map[string][]IsuListQueryRow),
+		byUserUUID:     make(map[string]Isu, len(isus)),
+		trendRows:      make([]TrendQueryRow, 0, len(isus)),
+		characters:     make([]string, 0),
+		characterKnown: make(map[string]struct{}),
+	}
+	for _, isu := range isus {
+		listRow := IsuListQueryRow{
+			ID:         isu.ID,
+			JIAIsuUUID: isu.JIAIsuUUID,
+			Name:       isu.Name,
+			Character:  isu.Character,
+		}
+		registry.byUser[isu.JIAUserID] = append(registry.byUser[isu.JIAUserID], listRow)
+		registry.byUserUUID[iconCacheKey(isu.JIAUserID, isu.JIAIsuUUID)] = isu
+		registry.trendRows = append(registry.trendRows, TrendQueryRow{
+			ID:         isu.ID,
+			JIAIsuUUID: isu.JIAIsuUUID,
+			Character:  isu.Character,
+		})
+		if _, ok := registry.characterKnown[isu.Character]; !ok {
+			registry.characterKnown[isu.Character] = struct{}{}
+			registry.characters = append(registry.characters, isu.Character)
+		}
+	}
+	for userID := range registry.byUser {
+		sort.Slice(registry.byUser[userID], func(i, j int) bool {
+			return registry.byUser[userID][i].ID > registry.byUser[userID][j].ID
+		})
+	}
+	sort.Strings(registry.characters)
+	return registry
+}
+
+func reloadIsuRegistry() error {
+	isus := []Isu{}
+	if err := db.Select(&isus,
+		"SELECT `id`, `jia_isu_uuid`, `name`, `character`, `jia_user_id` FROM `isu`"); err != nil {
+		return err
+	}
+	registry := buildIsuRegistry(isus)
+	isuRegistry.Store(registry)
+
+	known := make(map[string]struct{}, len(isus))
+	for _, isu := range isus {
+		known[isu.JIAIsuUUID] = struct{}{}
+	}
+	knownIsuCache.Lock()
+	knownIsuCache.uuids = known
+	knownIsuCache.loaded = true
+	knownIsuCache.Unlock()
+	return nil
+}
+
+func currentIsuRegistry() *IsuRegistry {
+	value := isuRegistry.Load()
+	if value == nil {
+		return nil
+	}
+	return value.(*IsuRegistry)
+}
+
+func (registry *IsuRegistry) listForUser(jiaUserID string) []IsuListQueryRow {
+	registry.RLock()
+	defer registry.RUnlock()
+	return append([]IsuListQueryRow(nil), registry.byUser[jiaUserID]...)
+}
+
+func (registry *IsuRegistry) get(jiaUserID string, jiaIsuUUID string) (Isu, bool) {
+	registry.RLock()
+	defer registry.RUnlock()
+	isu, ok := registry.byUserUUID[iconCacheKey(jiaUserID, jiaIsuUUID)]
+	return isu, ok
+}
+
+func (registry *IsuRegistry) trendSnapshot() ([]string, []TrendQueryRow) {
+	registry.RLock()
+	defer registry.RUnlock()
+	return append([]string(nil), registry.characters...), append([]TrendQueryRow(nil), registry.trendRows...)
+}
+
+func (registry *IsuRegistry) add(isu Isu) {
+	registry.Lock()
+	defer registry.Unlock()
+	listRow := IsuListQueryRow{
+		ID:         isu.ID,
+		JIAIsuUUID: isu.JIAIsuUUID,
+		Name:       isu.Name,
+		Character:  isu.Character,
+	}
+	registry.byUser[isu.JIAUserID] = append([]IsuListQueryRow{listRow}, registry.byUser[isu.JIAUserID]...)
+	registry.byUserUUID[iconCacheKey(isu.JIAUserID, isu.JIAIsuUUID)] = isu
+	registry.trendRows = append(registry.trendRows, TrendQueryRow{
+		ID:         isu.ID,
+		JIAIsuUUID: isu.JIAIsuUUID,
+		Character:  isu.Character,
+	})
+	if _, ok := registry.characterKnown[isu.Character]; !ok {
+		registry.characterKnown[isu.Character] = struct{}{}
+		registry.characters = append(registry.characters, isu.Character)
+		sort.Strings(registry.characters)
+	}
 }
 
 func cacheKnownIsu(jiaIsuUUID string) {
@@ -1263,7 +1386,7 @@ func postInitialize(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	if err = reloadKnownIsus(); err != nil {
+	if err = reloadIsuRegistry(); err != nil {
 		c.Logger().Errorf("db error: %v", err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
@@ -1395,17 +1518,12 @@ func getIsuList(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
-	isuList := []IsuListQueryRow{}
-	err = db.Select(
-		&isuList,
-		"SELECT i.`id`, i.`jia_isu_uuid`, i.`name`, i.`character`"+
-			" FROM `isu` i"+
-			" WHERE i.`jia_user_id` = ? ORDER BY i.`id` DESC",
-		jiaUserID)
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
+	registry := currentIsuRegistry()
+	if registry == nil {
+		c.Logger().Error("ISU registry is not loaded")
 		return c.NoContent(http.StatusInternalServerError)
 	}
+	isuList := registry.listForUser(jiaUserID)
 
 	responseList := []GetIsuListResponse{}
 	state := currentConditionState()
@@ -1579,6 +1697,13 @@ func postIsu(c echo.Context) error {
 	}
 
 	if !registrationOnly {
+		isu.JIAUserID = jiaUserID
+		registry := currentIsuRegistry()
+		if registry == nil {
+			c.Logger().Error("ISU registry is not loaded")
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		registry.add(isu)
 		cacheKnownIsu(jiaIsuUUID)
 		cacheIsuIcon(jiaUserID, jiaIsuUUID, image)
 		invalidateTrendCache()
@@ -1601,16 +1726,14 @@ func getIsuID(c echo.Context) error {
 
 	jiaIsuUUID := c.Param("jia_isu_uuid")
 
-	var res Isu
-	err = db.Get(&res, "SELECT `id`, `jia_isu_uuid`, `name`, `character` FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
-		jiaUserID, jiaIsuUUID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return c.String(http.StatusNotFound, "not found: isu")
-		}
-
-		c.Logger().Errorf("db error: %v", err)
+	registry := currentIsuRegistry()
+	if registry == nil {
+		c.Logger().Error("ISU registry is not loaded")
 		return c.NoContent(http.StatusInternalServerError)
+	}
+	res, ok := registry.get(jiaUserID, jiaIsuUUID)
+	if !ok {
+		return c.String(http.StatusNotFound, "not found: isu")
 	}
 
 	return c.JSON(http.StatusOK, res)
@@ -1677,14 +1800,12 @@ func getIsuGraph(c echo.Context) error {
 	}
 	date := time.Unix(datetimeInt64, 0).Truncate(time.Hour)
 
-	var count int
-	err = db.Get(&count, "SELECT COUNT(*) FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
-		jiaUserID, jiaIsuUUID)
-	if err != nil {
-		c.Logger().Errorf("db error: %v", err)
+	registry := currentIsuRegistry()
+	if registry == nil {
+		c.Logger().Error("ISU registry is not loaded")
 		return c.NoContent(http.StatusInternalServerError)
 	}
-	if count == 0 {
+	if _, ok := registry.get(jiaUserID, jiaIsuUUID); !ok {
 		return c.String(http.StatusNotFound, "not found: isu")
 	}
 
@@ -1925,19 +2046,16 @@ func getIsuConditions(c echo.Context) error {
 		startTime = time.Unix(startTimeInt64, 0)
 	}
 
-	var isuName string
-	err = db.Get(&isuName,
-		"SELECT name FROM `isu` WHERE `jia_isu_uuid` = ? AND `jia_user_id` = ?",
-		jiaIsuUUID, jiaUserID,
-	)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return c.String(http.StatusNotFound, "not found: isu")
-		}
-
-		c.Logger().Errorf("db error: %v", err)
+	registry := currentIsuRegistry()
+	if registry == nil {
+		c.Logger().Error("ISU registry is not loaded")
 		return c.NoContent(http.StatusInternalServerError)
 	}
+	isu, ok := registry.get(jiaUserID, jiaIsuUUID)
+	if !ok {
+		return c.String(http.StatusNotFound, "not found: isu")
+	}
+	isuName := isu.Name
 
 	state := currentConditionState()
 	conditionsResponse, loaded, err := getIsuConditionsFromCache(state, jiaIsuUUID, endTime, conditionLevel, startTime, conditionLimit, isuName)
@@ -2104,18 +2222,11 @@ func calculateConditionLevel(condition string) (string, error) {
 // GET /api/trend
 // ISUの性格毎の最新のコンディション情報
 func buildTrendResponse(state *ConditionState) ([]TrendResponse, error) {
-	characterList := []Isu{}
-	err := db.Select(&characterList, "SELECT `character` FROM `isu` GROUP BY `character`")
-	if err != nil {
-		return nil, fmt.Errorf("select characters: %w", err)
+	registry := currentIsuRegistry()
+	if registry == nil {
+		return nil, fmt.Errorf("ISU registry is not loaded")
 	}
-
-	latestConditions := []TrendQueryRow{}
-	err = db.Select(&latestConditions,
-		"SELECT `id`, `jia_isu_uuid`, `character` FROM `isu`")
-	if err != nil {
-		return nil, fmt.Errorf("select latest conditions: %w", err)
-	}
+	characterList, latestConditions := registry.trendSnapshot()
 
 	type groupedConditions struct {
 		info     []*TrendCondition
@@ -2152,7 +2263,7 @@ func buildTrendResponse(state *ConditionState) ([]TrendResponse, error) {
 
 	res := []TrendResponse{}
 	for _, character := range characterList {
-		conditions := grouped[character.Character]
+		conditions := grouped[character]
 		if conditions == nil {
 			conditions = newGroupedConditions()
 		}
@@ -2168,7 +2279,7 @@ func buildTrendResponse(state *ConditionState) ([]TrendResponse, error) {
 		})
 		res = append(res,
 			TrendResponse{
-				Character: character.Character,
+				Character: character,
 				Info:      conditions.info,
 				Warning:   conditions.warning,
 				Critical:  conditions.critical,
