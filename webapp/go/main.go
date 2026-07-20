@@ -135,6 +135,7 @@ var (
 	conditionForwardBatchCount   uint64
 	conditionForwardRequestCount uint64
 	conditionForwardMaxBatch     uint64
+	conditionForwardWorkerTotal  int
 )
 
 type conditionRequestBuffer [conditionRequestBufferSize]byte
@@ -229,6 +230,7 @@ type ConditionForwardStats struct {
 	AverageBatch  float64 `json:"average_batch"`
 	QueueDepth    int     `json:"queue_depth"`
 	QueueCapacity int     `json:"queue_capacity"`
+	Workers       int     `json:"workers"`
 }
 
 func resetConditionForwardStats() {
@@ -263,7 +265,7 @@ func currentConditionForwardStats() ConditionForwardStats {
 	return ConditionForwardStats{
 		Batches: batches, Requests: requests,
 		MaxBatch: atomic.LoadUint64(&conditionForwardMaxBatch), AverageBatch: average,
-		QueueDepth: queueDepth, QueueCapacity: queueCapacity,
+		QueueDepth: queueDepth, QueueCapacity: queueCapacity, Workers: conditionForwardWorkerTotal,
 	}
 }
 
@@ -475,7 +477,11 @@ func main() {
 		Timeout: 5 * time.Second,
 	}
 	if registrationOnly && conditionForwardURL != "" {
-		startConditionForwarders(8)
+		workerCount := getEnvInt("CONDITION_FORWARD_WORKERS", 1)
+		if workerCount < 1 || workerCount > 64 {
+			workerCount = 1
+		}
+		startConditionForwarders(workerCount)
 	}
 
 	e := echo.New()
@@ -1435,6 +1441,7 @@ func postForwardedConditionBatch(c echo.Context) error {
 }
 
 func startConditionForwarders(workerCount int) {
+	conditionForwardWorkerTotal = workerCount
 	conditionForwardQueue = make(chan *conditionForwardRequest, 65536)
 	for worker := 0; worker < workerCount; worker++ {
 		go conditionForwardWorker()
