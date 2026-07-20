@@ -861,3 +861,16 @@ slow/access/pprof/fgprof/OS計測だけを根拠に次の改善を選ぶ。
 - E50のメタデータcacheは維持し、condition locationだけ`proxy_request_buffering off`へ戻す。これによりNginxがrequest body全体を待たず、到着したchunkをGoへ先行転送する。
 - buffering onのE50 repeatはcondition 202が248,181件、4xxが5,456件、平均14ms、p95 68ms、1登録あたり202が約271.8件だった。E51では202/4xx、平均/p95、Goのbody read待ち、登録数、scoreを比較する。
 - 202 throughputまたはscoreが明確に改善すればstreamingを採用する。400/499やtail latencyだけが悪化し、score/登録あたり202も改善しなければbuffering onへ戻す。
+
+### E51 result
+
+- 公式benchmark `22f85044-856d-4cb6-8c66-55fecb2d6520`は138,586点、PASSED、減点1、timeout 277。計測runは`20260720T040338.287491Z-s1-a8b2f1`で、全hostが`ANALYZED`、全`errors.txt`は空だった。
+- streamingへ戻すとcondition bodyの`io.ReadAll`待ちはfgprofで累積2,764.97 goroutine秒、`postIsuCondition`全体は2,786.59秒になった。buffering onのE50 2回ではbody readもhandlerもfgprof上位50件に現れず、Nginxが完全なbodyだけをGoへ渡していたことを確認できた。
+- conditionの202は243,911件でE50 repeatの248,181件を下回り、登録成功も908件でE50 repeatの913件を下回った。1登録あたり202は約268.6件、condition p95は67msで、E50 repeatの約271.8件・68msに対してthroughput改善はない。POST ISUには500も1件発生した。
+- scoreもE50の138,810点・143,994点を上回らなかった。streamingは大量の未完了body待ちgoroutineをAppへ移すだけで直接指標を改善しなかったため棄却し、conditionのrequest bufferingをonへ戻す。
+
+### E52 expectation
+
+- vendor JSは743,417 bytesのまま1runに1,314〜1,458回配信され、E50/E51では約0.98〜1.08GBを占め、平均202〜221ms、p95 638〜763msだった。s1はCPUが約45%使われ、平均約49MB/sを送信している一方、同じassetには207,404-byteの正しい`.gz`が初期imageから存在する。
+- Nginxは`http_gzip_static_module`を備えているため、asset locationで`gzip_static on`を有効にする。アプリやAPI responseは圧縮せず、`Accept-Encoding: gzip`を送るclientだけに事前圧縮済みassetを返す。
+- deploy前後で元fileとgzip展開後のSHA-256一致、gzipあり/なしのContent-Length・Content-Encoding・ETag、304応答、Nginx config testを確認する。公式validを保ち、vendor送信byte、p50/p95、s1 network/system CPU、登録成功、scoreが改善すれば採用する。validator不一致、5xx、またはvendorの直接指標が改善しなければ無効化する。
