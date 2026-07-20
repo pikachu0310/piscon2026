@@ -32,6 +32,7 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 | B10 | 20:13 | `e8d6467` | Keep the condition edge on s2 but route registration back to newly freed s3 | B9 colocated registration with the saturated edge and produced 779 registration 499s plus seven 500/502 responses | portal `40713158-859f-4ba4-a1bb-dc2cb68def5d`; artifact `20260720T111323.749645Z-s1-816101` | 147,446, PASSED, deduction 0 | Stronger total-work/correctness frontier: 999 registrations and more condition 202, but less read work than B9; batch the private hop next |
 | B11 | 20:20 | `3f0fc62` | Keep B10 routing and batch up to 64 already-queued compact condition updates behind eight edge workers | B10 spent 52.98 edge CPU-seconds while synchronously forwarding each accepted body and returned about 118k condition 499s | portal `cf2f1369-52fb-43a3-9965-26b1fcc7cf24`; artifact `20260720T112047.518093Z-s1-cc4808` | **156,224**, PASSED, deduction 0 | New overall capacity/correctness champion: near-score-champion result while accepting 2.41x B9 condition writes at much lower CPU cost |
 | B12 | 20:34 | `eeafca4` intent, B11 effective | Intended 3:1 split of condition ingress across s2 and s3 | Validate deployment from captured `upstream_addr`, not only repository diff and `nginx -t` | portal `dd5e2228-86d9-496a-afa1-6416f3bce7ed`; artifact `20260720T113448.928674Z-s1-0e9c09` | **151,449**, PASSED, deduction 0 | Valid B11 repeat and new condition-ingest count frontier; not a split experiment because all 261,883 condition attempts still reached s2 |
+| B13 | 20:42 | `eeafca4` effective | Send condition POSTs 3:1 to the batched s2 edge and directly to authoritative s3 | B11/B12 left edge CPU above authoritative CPU; every route still updates the sole s3 generation | portal `04b6a6bd-0294-474c-9424-37a5c0603e9a`; artifact `20260720T114250.931832Z-s1-c1eddf` | **162,980**, PASSED, deduction 0 | New scalar, condition-ingest, and balanced-capacity champion; test 2:1 to close the remaining CPU gap |
 
 ### B0 facts
 
@@ -221,15 +222,37 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   the weighted config, and `nginx -T` plus eight loopback requests confirm an
   exact 6:2 s2:s3 split. The first actual split run is B13.
 
+### B13 decision: balanced ingress joined score and capacity frontiers
+
+- The weighted upstream sent 216,617 attempts to s2 and 72,208 directly to s3,
+  an exact 3:1 split. Both routes update the single authoritative generation on
+  s3, so reads retain immediate consistency.
+- Official score reached **162,980**, PASSED with deduction 0, exceeding B9's
+  former 160,102 score champion. At the same time, accepted condition writes
+  reached **279,985**, 15.8% above B11 and 2.79x B9. Condition 499 fell to
+  5,641. Registration remained healthy at 900 successes and three 499s.
+- Read work remained competitive: condition reads rose to 26,468, though trend
+  reads fell to 23,999. This result is not built solely by shedding writes in
+  favor of reads as B9 was.
+- Edge App CPU fell 41.16 -> 36.31 sampled seconds while s3 rose 21.85 -> 29.26
+  as intended. Total App CPU per accepted condition fell about 10% from B11,
+  even though the total CPU sample count rose slightly with much more work.
+- B13 is the first configuration to hold the scalar score, condition-ingest,
+  and balanced-capacity frontiers simultaneously. It is backed up on all three
+  servers under `/home/isucon/score-champion-b13`. A 2:1 edge:direct split is
+  the next bounded experiment because it should bring the two App CPU samples
+  close to equal.
+
 ## Four current-system maps
 
 ### Traffic
 
-The live B11 experiment is `benchmark -> s1 Nginx/TLS`. Condition POST bodies
-terminate at the edge App on s2, where they are decoded and converted to a
-compact private format. Up to 64 already-queued updates share one request to
-the authoritative App on s3. Registration and every public read execute on s3;
-both Apps use MariaDB on s2. Static pages and assets terminate on s1.
+The live B13 experiment is `benchmark -> s1 Nginx/TLS`. Condition POST bodies
+are weighted 3:1 between the edge App on s2 and authoritative App on s3. The s2
+path decodes and batches up to 64 already-queued compact updates to s3; the s3
+path updates that same state directly. Registration and every public read
+execute on s3; both Apps use MariaDB on s2. Static pages and assets terminate
+on s1.
 
 ### State ownership
 
@@ -299,3 +322,12 @@ if their first official score is flat or lower.
   classes, tail latency, and resource cost together. A score drop accompanied
   by more valid downstream work or lower unit cost remains a retained frontier;
   it receives follow-up experiments rather than an automatic rollback.
+
+### 20:44 JST
+
+- B13 unifies the frontiers at 162,980 score, 279,985 accepted condition writes
+  and deduction 0. Its measured 3:1 ingress split also lowers CPU per accepted
+  condition by about 10% from B11.
+- The remaining topology signal is an s2:s3 App CPU sample ratio of 36.31:29.26.
+  Test 2:1 next, then stop tuning this ratio if score/work/unit-cost do not move
+  together and return to the metadata/state-index structural families.

@@ -8,23 +8,21 @@ work to move saturation downstream.
 
 ## Score champion
 
-- Status: B9 validated
-- Commit: `9d025e4`
-- Topology declaration: s1=Nginx; s2=MariaDB plus registration/condition-edge
-  App; s3=authoritative compact-state/read App
-- Benchmark ID / score / validity: `f8ee8044-c525-4eaa-9a3d-a9af2cf51953`,
-  **160,102**, PASSED, deduction 6
-- Artifact: `20260720T110736.312178Z-s1-18f414`
-- Deployed app source provenance: `9d025e4`
-- B9 App binary SHA-256: `359b5e431fcbd8dccd731961683e626401affe4d8b4f70e6ad4267d15435fc1c`
-- B6 Nginx main SHA-256: `10cb2bce3bb674077c960f0a3910972d7184b97cec111669e40dab64514328b9`
-- B9 Nginx site SHA-256: `9f43aefdb8ad8fa74bfac64a49ec0c3576daa5b47bcc48596b2a5ca2c7c122fe`
-- B9 s2 drop-in SHA-256: `6e679970dfebd88caa4c69010016e8a7479baebe18913e1927d255d6fd3e0c23`
-- B9 s3 drop-in SHA-256: `5b779468eb28ee1738127950bf3609a39cf59f5456c8b15afacc6ebe6843b61c`
+- Status: B13 validated
+- Commit/config provenance: batched App `3f0fc62`; weighted Nginx `eeafca4`
+- Topology declaration: s1=Nginx; s2=MariaDB plus compact condition-edge App;
+  s3=authoritative compact-state/read/registration App; condition ingress 3:1
+  through s2 versus directly to s3
+- Benchmark ID / score / validity: `04b6a6bd-0294-474c-9424-37a5c0603e9a`,
+  **162,980**, PASSED, deduction 0
+- Artifact: `20260720T114250.931832Z-s1-c1eddf`
+- B13 App binary SHA-256: `dbecb0596c0ade48829456738a12b0a70046f6b178fc5974d677df5f575dd841`
+- B13 Nginx main SHA-256: `10cb2bce3bb674077c960f0a3910972d7184b97cec111669e40dab64514328b9`
+- B13 Nginx site SHA-256: `fc45728f3baeeb614f31c04c62bff367e09919ff2ce7f86a093afa34b5d62602`
 - s2 MariaDB tuning SHA-256: `b7462f1f41615fa7a733871d2aed3969973708e02497d0f5526e8e4e10ea31af`
-- B9 is backed up server-side under `/home/isucon/score-champion-b9`. B6 remains
-  fully restorable under `/home/isucon/score-champion-b6`; B0 remains under
-  `/home/isucon/score-champion-b0`.
+- B13 is backed up server-side under `/home/isucon/score-champion-b13`. B11's
+  capacity champion, B9's prior scalar champion, B6's single-App champion and
+  B0 remain separately restorable in their corresponding backup directories.
 
 ## Capacity frontier
 
@@ -136,6 +134,18 @@ work to move saturation downstream.
   active `sites-enabled` path was an independent regular file
 - Decision: retained as a B11 repeat and condition-ingest frontier, not labeled
   as evidence for or against load balancing. B13 is the corrected experiment.
+
+### B13: 3:1 edge/direct condition ingress (`eeafca4`)
+
+- Score: 162,980, PASSED, deduction 0 (new score champion)
+- Accepted work: 279,985 condition 202 (new ingest champion), 900 registration
+  201, 23,999 trend 200 and 26,468 condition-read 200
+- Actual routing: 216,617 condition attempts to s2 and 72,208 to s3, exactly
+  matching the intended 3:1 ratio
+- Resource shift: s2 App CPU 36.31 seconds, s3 App CPU 29.26 seconds; total App
+  CPU per condition 202 is about 10% lower than B11
+- Decision: **current score and overall capacity/correctness champion**. It is
+  fully backed up; test 2:1 once to close the measured CPU gap.
 
 ## Decision rule
 
