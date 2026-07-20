@@ -263,6 +263,17 @@ work to move saturation downstream.
 - Decision: promote as the current overall capacity frontier. Continue from
   it rather than selecting by scalar score alone.
 
+### B26/B27: reusable private response state (`f6e566c`)
+
+- Scores: B26 148,302; B27 142,847; both PASSED with deduction 0
+- Tracked successful work: 304,944 and 301,523
+- Unit cost: total App CPU 52.76/53.15 seconds, about **0.173/0.176 ms** per
+  tracked success versus B24/B25's 0.176/0.180 ms
+- Private path: B26 cumulative `forwardConditionBatch` CPU fell 3.83 -> 3.31
+  seconds versus B24; the fixed status decoder itself is zero-allocation
+- Decision: retain as the unit-cost frontier. Offered load was below B25, so
+  the lower scalar scores do not justify restoring measured allocation waste.
+
 ## Decision rule
 
 Every run is judged on five axes:

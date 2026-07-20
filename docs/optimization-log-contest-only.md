@@ -412,6 +412,24 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   private HTTP path, 84 MB in tiny response `ReadAll`, and 27 MB in per-request
   result/channel state. These become the next isolated target.
 
+### B26/B27 decision: reuse private response and synchronization state
+
+- The eight-worker transport and wire format stayed fixed. Each edge request
+  now reuses its result channel, reads the at-most-134-byte private response
+  into a stack buffer, and decodes statuses into the existing result slice.
+- The status decoder microbenchmark moved from about 190 ns, 512 B and one
+  allocation to about 70 ns with zero bytes and zero allocations. Normal and
+  race tests passed.
+- B26 scored 148,302 with 304,944 tracked successes and 52.76 App CPU seconds,
+  the best CPU per tracked success in the family at about **0.173 ms**. Private
+  hop cumulative CPU fell from B24's 3.83 to 3.31 seconds.
+- B27 scored 142,847 with 301,523 tracked successes and 53.15 CPU seconds,
+  about 0.176 ms per success. Its offered/error mix was weaker, but unit cost
+  remained equal to B24 and below B25. Both runs were PASSED with deduction 0.
+- Retain the allocation removal. The next authoritative profile target is the
+  143 MB full-history/latest snapshot plus 19.5 MB metadata snapshot used by
+  list/trend reads.
+
 ## Four current-system maps
 
 ### Traffic
@@ -544,3 +562,11 @@ if their first official score is flat or lower.
   per-request synchronization objects as the next removable costs. Keep batch
   worker count at eight for that experiment so transport concurrency is not
   confounded with allocation removal.
+
+### 22:07 JST
+
+- B26/B27 retain commit `f6e566c`; B26 establishes the best measured unit CPU
+  cost even though neither run receives B25's high offered-load trajectory.
+- List/trend currently copy every history and registry trend row before
+  selecting latest values. Replace those snapshots with protected direct
+  lookups, keeping response ordering and registry/state ownership unchanged.
