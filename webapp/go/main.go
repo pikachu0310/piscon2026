@@ -61,6 +61,7 @@ var (
 	registrationGateToken         string
 	conditionForwardURL           string
 	conditionForwardClient        *http.Client
+	conditionForwardQueue         chan *conditionForwardRequest
 
 	sessionCache = struct {
 		sync.RWMutex
@@ -193,6 +194,12 @@ type ForwardedCondition struct {
 	Timestamp int64
 	Message   string
 	Flags     uint8
+}
+
+type conditionForwardRequest struct {
+	jiaIsuUUID string
+	conditions []ForwardedCondition
+	result     chan int
 }
 
 func newRegistrationRequestGate() *registrationRequestGate {
@@ -377,6 +384,9 @@ func main() {
 		},
 		Timeout: 5 * time.Second,
 	}
+	if registrationOnly && conditionForwardURL != "" {
+		startConditionForwarders(8)
+	}
 
 	e := echo.New()
 	e.Debug = false
@@ -402,6 +412,7 @@ func main() {
 	e.POST("/internal/registration-gate/close", postRegistrationGateClose)
 	e.POST("/internal/registration-gate/open", postRegistrationGateOpen)
 	e.POST("/internal/condition", postForwardedCondition)
+	e.POST("/internal/condition-batch", postForwardedConditionBatch)
 
 	e.GET("/", getIndex)
 	e.GET("/isu/:jia_isu_uuid", getIndex)
@@ -933,6 +944,102 @@ func decodeForwardedConditions(body []byte) (string, []ForwardedCondition, error
 	return jiaIsuUUID, conditions, nil
 }
 
+func encodeForwardedConditionBatch(requests []*conditionForwardRequest) ([]byte, error) {
+	if len(requests) == 0 || len(requests) > int(^uint16(0)) {
+		return nil, fmt.Errorf("invalid forwarded batch size")
+	}
+	payloads := make([][]byte, len(requests))
+	size := 4 + 2
+	for index := range requests {
+		payload, err := encodeForwardedConditions(requests[index].jiaIsuUUID, requests[index].conditions)
+		if err != nil {
+			return nil, err
+		}
+		if uint64(len(payload)) > uint64(^uint32(0)) {
+			return nil, fmt.Errorf("forwarded payload is too large")
+		}
+		payloads[index] = payload
+		size += 4 + len(payload)
+	}
+	body := make([]byte, size)
+	copy(body, "ICB1")
+	binary.LittleEndian.PutUint16(body[4:], uint16(len(payloads)))
+	offset := 6
+	for index := range payloads {
+		binary.LittleEndian.PutUint32(body[offset:], uint32(len(payloads[index])))
+		offset += 4
+		copy(body[offset:], payloads[index])
+		offset += len(payloads[index])
+	}
+	return body, nil
+}
+
+func decodeForwardedConditionBatch(body []byte) ([]string, [][]ForwardedCondition, error) {
+	if len(body) < 6 || string(body[:4]) != "ICB1" {
+		return nil, nil, fmt.Errorf("invalid forwarded batch")
+	}
+	count := int(binary.LittleEndian.Uint16(body[4:]))
+	if count == 0 || count > (len(body)-6)/4 {
+		return nil, nil, fmt.Errorf("invalid forwarded batch count")
+	}
+	uuids := make([]string, count)
+	conditions := make([][]ForwardedCondition, count)
+	offset := 6
+	for index := 0; index < count; index++ {
+		if len(body)-offset < 4 {
+			return nil, nil, fmt.Errorf("truncated forwarded batch")
+		}
+		payloadLength := uint64(binary.LittleEndian.Uint32(body[offset:]))
+		offset += 4
+		if payloadLength > uint64(len(body)-offset) {
+			return nil, nil, fmt.Errorf("truncated forwarded payload")
+		}
+		payloadEnd := offset + int(payloadLength)
+		uuid, decoded, err := decodeForwardedConditions(body[offset:payloadEnd])
+		if err != nil {
+			return nil, nil, err
+		}
+		uuids[index] = uuid
+		conditions[index] = decoded
+		offset = payloadEnd
+	}
+	if offset != len(body) {
+		return nil, nil, fmt.Errorf("trailing forwarded batch data")
+	}
+	return uuids, conditions, nil
+}
+
+func encodeForwardedConditionStatuses(statuses []int) ([]byte, error) {
+	if len(statuses) == 0 || len(statuses) > int(^uint16(0)) {
+		return nil, fmt.Errorf("invalid forwarded status count")
+	}
+	body := make([]byte, 6+2*len(statuses))
+	copy(body, "ICR1")
+	binary.LittleEndian.PutUint16(body[4:], uint16(len(statuses)))
+	for index := range statuses {
+		if statuses[index] < 0 || statuses[index] > int(^uint16(0)) {
+			return nil, fmt.Errorf("invalid forwarded status")
+		}
+		binary.LittleEndian.PutUint16(body[6+2*index:], uint16(statuses[index]))
+	}
+	return body, nil
+}
+
+func decodeForwardedConditionStatuses(body []byte, expected int) ([]int, error) {
+	if len(body) < 6 || string(body[:4]) != "ICR1" {
+		return nil, fmt.Errorf("invalid forwarded status response")
+	}
+	count := int(binary.LittleEndian.Uint16(body[4:]))
+	if count != expected || len(body) != 6+2*count {
+		return nil, fmt.Errorf("unexpected forwarded status count")
+	}
+	statuses := make([]int, count)
+	for index := range statuses {
+		statuses[index] = int(binary.LittleEndian.Uint16(body[6+2*index:]))
+	}
+	return statuses, nil
+}
+
 func applyForwardedConditions(jiaIsuUUID string, conditions []ForwardedCondition) (int, error) {
 	conditionWriteBarrier.RLock()
 	defer conditionWriteBarrier.RUnlock()
@@ -995,27 +1102,105 @@ func postForwardedCondition(c echo.Context) error {
 	return c.NoContent(status)
 }
 
-func postIsuConditionForward(c echo.Context, jiaIsuUUID string, conditions []ForwardedCondition) error {
-	if conditionForwardURL == "" {
+func postForwardedConditionBatch(c echo.Context) error {
+	if registrationOnly || registrationGateToken == "" || c.Request().Header.Get("X-Registration-Gate-Token") != registrationGateToken {
+		return c.NoContent(http.StatusNotFound)
+	}
+	body, err := ioutil.ReadAll(c.Request().Body)
+	if err != nil {
+		return c.NoContent(http.StatusBadRequest)
+	}
+	uuids, conditionBatches, err := decodeForwardedConditionBatch(body)
+	if err != nil {
+		return c.NoContent(http.StatusBadRequest)
+	}
+	statuses := make([]int, len(uuids))
+	for index := range uuids {
+		statuses[index], err = applyForwardedConditions(uuids[index], conditionBatches[index])
+		if err != nil {
+			c.Logger().Errorf("db error: %v", err)
+			statuses[index] = http.StatusInternalServerError
+		}
+	}
+	response, err := encodeForwardedConditionStatuses(statuses)
+	if err != nil {
 		return c.NoContent(http.StatusInternalServerError)
 	}
-	body, err := encodeForwardedConditions(jiaIsuUUID, conditions)
+	return c.Blob(http.StatusOK, "application/octet-stream", response)
+}
+
+func startConditionForwarders(workerCount int) {
+	conditionForwardQueue = make(chan *conditionForwardRequest, 65536)
+	for worker := 0; worker < workerCount; worker++ {
+		go conditionForwardWorker()
+	}
+}
+
+func conditionForwardWorker() {
+	for first := range conditionForwardQueue {
+		requests := make([]*conditionForwardRequest, 1, 64)
+		requests[0] = first
+	collect:
+		for len(requests) < cap(requests) {
+			select {
+			case request := <-conditionForwardQueue:
+				requests = append(requests, request)
+			default:
+				break collect
+			}
+		}
+		statuses := forwardConditionBatch(requests)
+		for index := range requests {
+			requests[index].result <- statuses[index]
+		}
+	}
+}
+
+func forwardConditionBatch(requests []*conditionForwardRequest) []int {
+	statuses := make([]int, len(requests))
+	for index := range statuses {
+		statuses[index] = http.StatusInternalServerError
+	}
+	body, err := encodeForwardedConditionBatch(requests)
 	if err != nil {
-		return c.String(http.StatusBadRequest, "bad request body")
+		return statuses
 	}
 	req, err := http.NewRequest(http.MethodPost, conditionForwardURL, bytes.NewReader(body))
 	if err != nil {
-		return c.NoContent(http.StatusInternalServerError)
+		return statuses
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Registration-Gate-Token", registrationGateToken)
 	res, err := conditionForwardClient.Do(req)
 	if err != nil {
-		c.Logger().Errorf("failed to forward condition: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
+		return statuses
 	}
 	defer res.Body.Close()
-	return conditionStatusResponse(c, res.StatusCode)
+	if res.StatusCode != http.StatusOK {
+		return statuses
+	}
+	responseBody, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return statuses
+	}
+	decoded, err := decodeForwardedConditionStatuses(responseBody, len(requests))
+	if err != nil {
+		return statuses
+	}
+	return decoded
+}
+
+func postIsuConditionForward(c echo.Context, jiaIsuUUID string, conditions []ForwardedCondition) error {
+	if conditionForwardQueue == nil {
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	request := &conditionForwardRequest{
+		jiaIsuUUID: jiaIsuUUID,
+		conditions: conditions,
+		result:     make(chan int, 1),
+	}
+	conditionForwardQueue <- request
+	return conditionStatusResponse(c, <-request.result)
 }
 
 func getJIAServiceURL(tx *sqlx.Tx) string {

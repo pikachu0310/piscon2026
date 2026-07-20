@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -213,5 +214,62 @@ func TestForwardedConditionCodecRejectsCorruption(t *testing.T) {
 		if _, _, decodeErr := decodeForwardedConditions(test); decodeErr == nil {
 			t.Fatalf("corrupt case %d was accepted", index)
 		}
+	}
+}
+
+func TestForwardedConditionBatchCodecRoundTrip(t *testing.T) {
+	requests := []*conditionForwardRequest{
+		{jiaIsuUUID: "uuid-1", conditions: []ForwardedCondition{{Timestamp: 1, Message: "one", Flags: 1}}},
+		{jiaIsuUUID: "uuid-2", conditions: []ForwardedCondition{{Timestamp: 2, Message: "二", Flags: 10}, {Timestamp: 3, Message: "", Flags: 0xff}}},
+	}
+	body, err := encodeForwardedConditionBatch(requests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uuids, conditions, err := decodeForwardedConditionBatch(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(uuids, []string{"uuid-1", "uuid-2"}) {
+		t.Fatalf("UUIDs = %#v", uuids)
+	}
+	for index := range requests {
+		if !reflect.DeepEqual(conditions[index], requests[index].conditions) {
+			t.Fatalf("conditions[%d] = %#v, want %#v", index, conditions[index], requests[index].conditions)
+		}
+	}
+
+	wantStatuses := []int{http.StatusAccepted, http.StatusNotFound, http.StatusInternalServerError}
+	statusBody, err := encodeForwardedConditionStatuses(wantStatuses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotStatuses, err := decodeForwardedConditionStatuses(statusBody, len(wantStatuses))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotStatuses, wantStatuses) {
+		t.Fatalf("statuses = %#v, want %#v", gotStatuses, wantStatuses)
+	}
+}
+
+func TestForwardedConditionBatchCodecRejectsCorruption(t *testing.T) {
+	request := &conditionForwardRequest{jiaIsuUUID: "uuid", conditions: []ForwardedCondition{{Timestamp: 1}}}
+	body, err := encodeForwardedConditionBatch([]*conditionForwardRequest{request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, test := range [][]byte{nil, body[:len(body)-1], append(append([]byte{}, body...), 0)} {
+		if _, _, decodeErr := decodeForwardedConditionBatch(test); decodeErr == nil {
+			t.Fatalf("corrupt batch case %d was accepted", index)
+		}
+	}
+
+	statusBody, err := encodeForwardedConditionStatuses([]int{http.StatusAccepted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = decodeForwardedConditionStatuses(statusBody, 2); err == nil {
+		t.Fatal("wrong expected status count was accepted")
 	}
 }
