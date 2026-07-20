@@ -331,6 +331,59 @@ func TestForwardedConditionBatchCodecRejectsCorruption(t *testing.T) {
 	}
 }
 
+func TestDecodedForwardBatchDoesNotAliasRequestBody(t *testing.T) {
+	requests := []*conditionForwardRequest{{
+		jiaIsuUUID: "persistent-uuid",
+		conditions: []ForwardedCondition{{Timestamp: 1, Message: "persistent message", Flags: 3}},
+	}}
+	body, err := encodeForwardedConditionBatch(requests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uuids, conditions, err := decodeForwardedConditionBatch(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range body {
+		body[index] = 'x'
+	}
+	if uuids[0] != "persistent-uuid" || conditions[0][0].Message != "persistent message" {
+		t.Fatalf("decoded batch aliases request body: uuids=%q conditions=%#v", uuids, conditions)
+	}
+}
+
+func TestForwardBatchRequestBodyUsesBoundedPool(t *testing.T) {
+	body, err := encodeForwardedConditionBatch(benchmarkForwardRequests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, "/internal/condition-batch", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, pooled, err := readForwardBatchRequestBody(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pooled == nil || !bytes.Equal(got, body) {
+		t.Fatal("forward batch did not use the bounded pool")
+	}
+	releaseForwardBatchRequestBuffer(pooled)
+
+	large := bytes.Repeat([]byte("x"), forwardBatchRequestBufSize+1)
+	request, err = http.NewRequest(http.MethodPost, "/internal/condition-batch", bytes.NewReader(large))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, pooled, err = readForwardBatchRequestBody(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pooled != nil || !bytes.Equal(got, large) {
+		t.Fatal("large forward batch fallback differs")
+	}
+}
+
 func TestIsuRegistryIndexesAndPublishesRegistration(t *testing.T) {
 	registry := buildIsuRegistry([]Isu{
 		{ID: 3, JIAIsuUUID: "isu-3", Name: "third", Character: "zeta", JIAUserID: "user-a"},
@@ -536,6 +589,14 @@ var benchmarkForwardRequests = func() []*conditionForwardRequest {
 	return requests
 }()
 
+var benchmarkForwardBatchBody = func() []byte {
+	body, err := encodeForwardedConditionBatch(benchmarkForwardRequests)
+	if err != nil {
+		panic(err)
+	}
+	return body
+}()
+
 func BenchmarkForwardBatchEncoderReference(b *testing.B) {
 	b.ReportAllocs()
 	for index := 0; index < b.N; index++ {
@@ -550,6 +611,31 @@ func BenchmarkForwardBatchEncoderDirect(b *testing.B) {
 	for index := 0; index < b.N; index++ {
 		if _, err := encodeForwardedConditionBatch(benchmarkForwardRequests); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkForwardBatchRequestReadAll(b *testing.B) {
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		request := &http.Request{Body: io.NopCloser(bytes.NewReader(benchmarkForwardBatchBody))}
+		if _, err := io.ReadAll(request.Body); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkForwardBatchRequestPooled(b *testing.B) {
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		request := &http.Request{
+			Body:          io.NopCloser(bytes.NewReader(benchmarkForwardBatchBody)),
+			ContentLength: int64(len(benchmarkForwardBatchBody)),
+		}
+		if _, pooled, err := readForwardBatchRequestBody(request); err != nil {
+			b.Fatal(err)
+		} else {
+			releaseForwardBatchRequestBuffer(pooled)
 		}
 	}
 }

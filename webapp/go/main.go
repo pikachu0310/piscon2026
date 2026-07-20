@@ -48,6 +48,7 @@ const (
 	conditionFlagSitting        = uint8(1 << 3)
 	conditionRequestBufferSize  = 2048
 	conditionForwardBatchLimit  = 64
+	forwardBatchRequestBufSize  = 128 * 1024
 )
 
 var (
@@ -128,9 +129,13 @@ var (
 	conditionForwardRequestPool = sync.Pool{New: func() interface{} {
 		return &conditionForwardRequest{result: make(chan int, 1)}
 	}}
+	forwardBatchRequestPool = sync.Pool{New: func() interface{} {
+		return new(forwardBatchRequestBuffer)
+	}}
 )
 
 type conditionRequestBuffer [conditionRequestBufferSize]byte
+type forwardBatchRequestBuffer [forwardBatchRequestBufSize]byte
 
 type Config struct {
 	Name string `db:"name"`
@@ -1076,6 +1081,27 @@ func releaseConditionRequestBuffer(buffer *conditionRequestBuffer) {
 	}
 }
 
+func readForwardBatchRequestBody(request *http.Request) ([]byte, *forwardBatchRequestBuffer, error) {
+	if request.ContentLength < 0 || request.ContentLength > forwardBatchRequestBufSize {
+		body, err := ioutil.ReadAll(request.Body)
+		return body, nil, err
+	}
+
+	buffer := forwardBatchRequestPool.Get().(*forwardBatchRequestBuffer)
+	body := buffer[:int(request.ContentLength)]
+	if _, err := io.ReadFull(request.Body, body); err != nil {
+		forwardBatchRequestPool.Put(buffer)
+		return nil, nil, err
+	}
+	return body, buffer, nil
+}
+
+func releaseForwardBatchRequestBuffer(buffer *forwardBatchRequestBuffer) {
+	if buffer != nil {
+		forwardBatchRequestPool.Put(buffer)
+	}
+}
+
 func forwardedConditionsEncodedSize(jiaIsuUUID string, conditions []ForwardedCondition) (int, error) {
 	if len(jiaIsuUUID) > int(^uint16(0)) || uint64(len(conditions)) > uint64(^uint32(0)) {
 		return 0, fmt.Errorf("condition batch is too large")
@@ -1335,11 +1361,12 @@ func postForwardedConditionBatch(c echo.Context) error {
 	if registrationOnly || registrationGateToken == "" || c.Request().Header.Get("X-Registration-Gate-Token") != registrationGateToken {
 		return c.NoContent(http.StatusNotFound)
 	}
-	body, err := ioutil.ReadAll(c.Request().Body)
+	body, pooledBody, err := readForwardBatchRequestBody(c.Request())
 	if err != nil {
 		return c.NoContent(http.StatusBadRequest)
 	}
 	uuids, conditionBatches, err := decodeForwardedConditionBatch(body)
+	releaseForwardBatchRequestBuffer(pooledBody)
 	if err != nil {
 		return c.NoContent(http.StatusBadRequest)
 	}
