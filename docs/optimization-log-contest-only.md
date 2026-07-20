@@ -369,6 +369,27 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   diagnostics to inflate score: the expensive wall profiler remains present
   at peak load, while the other four evidence streams remain full-duration.
 
+### B22/B23 decision: pooled request bodies lower GC while work expands
+
+- Measured condition requests were about 1.5 KiB and below 2 KiB. The public
+  condition handler now reads known-size bodies once into a 2 KiB pooled
+  buffer; unknown-size or larger bodies keep the old unbounded fallback.
+  Tests prove decoded messages do not alias a returned buffer.
+- The isolated microbenchmark moved body reading from about 456 ns, 1,472 B
+  and four allocations to about 72 ns, 64 B and two allocations. Normal tests,
+  race tests, truncated-body handling and fallback handling all passed.
+- B22 scored 141,421 while setting a tracked-success frontier of **302,703**
+  and condition-write frontier of **253,477**. B23 scored 146,641 with 301,984
+  tracked successes and only 50 condition 499s. Both were PASSED with deduction
+  0.
+- Combined `runtime.mallocgc` fell to 6.86/6.81 seconds versus 7.64/8.67 in
+  the two no-pool baselines. Total App CPU was 52.74/55.11 seconds versus
+  55.79/57.52. The exact repeat therefore confirms lower GC and CPU across
+  different offered/read mixes.
+- Keep the body pool as a unit-cost and capacity improvement. B22 is another
+  direct example where a 141k score run is stronger on accepted work and CPU
+  efficiency than higher-scoring runs.
+
 ## Four current-system maps
 
 ### Traffic
@@ -483,3 +504,12 @@ if their first official score is flat or lower.
 - The new profile now attributes 2.18 seconds on s2 and 1.58 seconds on s3 to
   request-body `io.ReadAll`. Measured condition requests are about 1.5 KiB and
   stay below 2 KiB, so a bounded pooled-body experiment is next.
+
+### 21:47 JST
+
+- B22/B23 confirm that bounded request-body pooling reduces GC and App CPU
+  while preserving or increasing accepted work. Promote commit `85955ce`.
+- The remaining s2 profile spends 3.76 seconds in the private forwarding path.
+  Its encoder currently allocates one temporary payload per request and then
+  copies those payloads into a batch. Direct final-buffer encoding is the next
+  isolated change.

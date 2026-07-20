@@ -235,6 +235,20 @@ work to move saturation downstream.
   is caused by read/workload mix and is not grounds to restore the expensive
   full-minute fgprof.
 
+### B22/B23: pooled external condition bodies (`85955ce`)
+
+- Scores: B22 141,421; B23 146,641; both PASSED with deduction 0
+- B22 accepted **253,477** condition writes and **302,703** tracked successful
+  requests, new frontiers; B23 accepted 252,440 and 301,984 with only 50
+  condition 499s
+- GC cost: combined `runtime.mallocgc` was 6.86/6.81 seconds versus 7.64/8.67
+  for B20/B21 without the pool
+- Total App CPU: 52.74/55.11 seconds versus 55.79/57.52 while accepted work
+  stayed at or above the same level
+- Decision: promote as a unit-cost/capacity improvement. B22's lower scalar
+  score does not outweigh its best accepted-work total and lowest CPU per
+  tracked success in this experiment family.
+
 ## Decision rule
 
 Every run is judged on five axes:
