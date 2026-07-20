@@ -22,6 +22,8 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 | B0 | 18:27 | `e70329f` | Unmodified starting checkout and live deployment | Fresh measure capture: access, slow log, CPU pprof, fgprof, pidstat and sar | portal `8c9bab42-1521-421b-8be1-23e77a008fea`; artifact `20260720T092734.057516Z-s1-a948bf` | **134,310**, PASSED, deduction 0 | Initial score champion |
 | B1 | 18:42 | `891c84e` | Buffer complete condition request bodies at s1 before proxying to Go | Compare ingress status, handler wall, CPU, valid work and read latency with B0 | portal `c92807fa-0864-414d-8562-a3506f433a4b`; artifact `20260720T094228.582644Z-s1-af6c1c` | 131,466, PASSED, deduction 0 | Capacity result but not champion; keep commit, restore streaming for next isolated test |
 | B2 | 18:50 | `367dd65` | Runtime-gzip the large client bundle on s1 | B0 transferred 979 MiB of vendor JS; compressed body is 211 KiB instead of 743 KiB | portal `78ca02d5-1e8d-456b-ac82-7d8e8a9240e1`; artifact `20260720T095009.878600Z-s1-4a0475` | 127,939, PASSED, deduction 0 | Mechanism valid, implementation rejected: runtime compression saturated ingress CPU |
+| B3 | 18:55 | `da4fd9a` | Precompress immutable assets and serve with `gzip_static` | Same wire reduction as B2 without runtime compression | portal `af7892ca-48a7-4925-8247-dd5103111a1b`; artifact `20260720T095553.416750Z-s1-92e3b8` | 125,165, PASSED, deduction 0 | Capacity-frontier candidate; repeat before decision |
+| B4 | 18:59 | `da4fd9a` | Exact repeat of B3 | Separate benchmark variance from static-compression mechanism | portal `926d9431-620d-4454-853d-4096d56eedba`; artifact `20260720T095959.518837Z-s1-a49d6d` | 128,296, PASSED, deduction 0 | Capacity frontier confirmed; not score champion |
 
 ### B0 facts
 
@@ -72,6 +74,21 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   proxied endpoint developed a large latency tail.
 - The bandwidth mechanism is retained, but compression must move outside the
   benchmark. B3 precompresses immutable assets once and uses `gzip_static`.
+
+### B3/B4 decision: same condition work at lower unit cost
+
+- B3/B4 scores were 125,165 and 128,296, below B0's 134,310.
+- B4 nevertheless completed 242,988 condition 202 responses versus B0's
+  243,741 (-0.3%), while condition 499 fell 3,073 -> 2,296 and App CPU samples
+  fell 37.03 -> 34.31 seconds (-7.3%). App CPU per successful condition fell
+  about 7%.
+- Registration success was lower (868 versus 893), so the saved work has not
+  converted to score. Precompression remains a capacity frontier and is the
+  base for downstream App allocation/state work; B0 remains score champion.
+- A post-run heap profile made the next constraint concrete: 191.7 MiB in use,
+  of which 142.4 MiB (74.3%) was `cacheConditionHistory` backing storage and
+  29.2 MiB was live `io.ReadAll` body buffers. The next structural family is a
+  compact generation-scoped condition representation plus streaming decode.
 
 ## Four current-system maps
 

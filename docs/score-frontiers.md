@@ -35,6 +35,16 @@
 - Decision: preserve compression as a capacity mechanism, replace runtime
   compression with prebuilt `.gz` files in B3
 
+### B3/B4: precompressed static assets (`da4fd9a`)
+
+- Scores: 125,165 and 128,296, both PASSED, deduction 0
+- Valid work on repeat: 242,988 condition 202, only 0.3% below B0
+- Unit cost: App CPU samples 34.31 seconds, 7.3% below B0; condition 499
+  reduced 25.3%; s1 transmission fell about 31%
+- Remaining downstream: registration success was 868 versus B0's 893
+- Decision: confirmed capacity frontier. Keep while condition memory/GC and
+  registration downstream experiments attempt to convert it to score.
+
 ## Decision rule
 
 The score champion is always restorable and is the final-mode candidate. A
