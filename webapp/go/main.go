@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"os"
@@ -970,26 +971,65 @@ func setRemoteRegistrationGate(action string) error {
 }
 
 func decodeIncomingConditions(body []byte) ([]ForwardedCondition, error) {
-	incoming := make([]IncomingCondition, 0, bytes.Count(body, []byte("{")))
-	if err := conditionJSON.Unmarshal(body, &incoming); err != nil || len(incoming) == 0 {
+	iterator := conditionJSON.BorrowIterator(body)
+	defer conditionJSON.ReturnIterator(iterator)
+	conditions := make([]ForwardedCondition, 0, bytes.Count(body, []byte("{")))
+	for iterator.ReadArray() {
+		condition := ForwardedCondition{Flags: 0xff}
+		isSitting := false
+		iterator.ReadObjectCB(func(iterator *jsoniter.Iterator, field string) bool {
+			switch field {
+			case "timestamp":
+				if iterator.ReadNil() {
+					condition.Timestamp = 0
+				} else {
+					condition.Timestamp = iterator.ReadInt64()
+				}
+			case "condition":
+				if iterator.ReadNil() {
+					condition.Flags = 0xff
+				} else if flags, ok := conditionBitsByString[iterator.ReadString()]; ok {
+					condition.Flags = flags
+				} else {
+					// The authoritative process checks UUID existence before format,
+					// so carry an invalid marker across the private hop.
+					condition.Flags = 0xff
+				}
+			case "message":
+				if iterator.ReadNil() {
+					condition.Message = ""
+				} else {
+					condition.Message = iterator.ReadString()
+				}
+			case "is_sitting":
+				if iterator.ReadNil() {
+					isSitting = false
+				} else {
+					isSitting = iterator.ReadBool()
+				}
+			default:
+				iterator.Skip()
+			}
+			return iterator.Error == nil
+		})
+		if iterator.Error != nil {
+			return nil, fmt.Errorf("bad request body: %w", iterator.Error)
+		}
+		if condition.Flags != 0xff && isSitting {
+			condition.Flags |= conditionFlagSitting
+		}
+		conditions = append(conditions, condition)
+	}
+	if iterator.Error != nil {
+		return nil, fmt.Errorf("bad request body: %w", iterator.Error)
+	}
+	// ReadArray consumes the closing bracket but not trailing input. Match
+	// json.Unmarshal by accepting only whitespace until EOF.
+	if next := iterator.WhatIsNext(); next != jsoniter.InvalidValue || !errors.Is(iterator.Error, io.EOF) {
 		return nil, fmt.Errorf("bad request body")
 	}
-
-	conditions := make([]ForwardedCondition, len(incoming))
-	for index := range incoming {
-		flags, ok := conditionBitsByString[incoming[index].Condition]
-		if !ok {
-			// The authoritative process checks UUID existence before format, as
-			// the original handler did. Carry an invalid marker across the hop.
-			flags = 0xff
-		} else if incoming[index].IsSitting {
-			flags |= conditionFlagSitting
-		}
-		conditions[index] = ForwardedCondition{
-			Timestamp: incoming[index].Timestamp,
-			Message:   incoming[index].Message,
-			Flags:     flags,
-		}
+	if len(conditions) == 0 {
+		return nil, fmt.Errorf("bad request body")
 	}
 	return conditions, nil
 }

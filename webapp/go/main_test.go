@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
 	"strings"
@@ -304,5 +305,77 @@ func TestIsuRegistryIndexesAndPublishesRegistration(t *testing.T) {
 	characters, rows = registry.trendSnapshot()
 	if !reflect.DeepEqual(characters, []string{"alpha", "beta", "zeta"}) || len(rows) != 4 {
 		t.Fatalf("trend snapshot after registration = characters %v, rows %d", characters, len(rows))
+	}
+}
+
+func referenceDecodeIncomingConditions(body []byte) ([]ForwardedCondition, error) {
+	incoming := []IncomingCondition{}
+	if err := conditionJSON.Unmarshal(body, &incoming); err != nil || len(incoming) == 0 {
+		return nil, fmt.Errorf("bad request body: %v", err)
+	}
+	conditions := make([]ForwardedCondition, len(incoming))
+	for index := range incoming {
+		flags, ok := conditionBitsByString[incoming[index].Condition]
+		if !ok {
+			flags = 0xff
+		} else if incoming[index].IsSitting {
+			flags |= conditionFlagSitting
+		}
+		conditions[index] = ForwardedCondition{
+			Timestamp: incoming[index].Timestamp,
+			Message:   incoming[index].Message,
+			Flags:     flags,
+		}
+	}
+	return conditions, nil
+}
+
+func TestDirectConditionDecoderMatchesReference(t *testing.T) {
+	tests := []string{
+		`[{"timestamp":1620000000,"condition":"is_dirty=false,is_overweight=true,is_broken=false","message":"ok","is_sitting":true}]`,
+		`[{"unknown":{"nested":[1,2,3]},"message":"escaped \"quote\" and 日本語","is_sitting":false,"condition":"is_dirty=true,is_overweight=false,is_broken=true","timestamp":-1}]`,
+		`[{"timestamp":null,"condition":null,"message":null,"is_sitting":null}]`,
+		`[{"timestamp":1,"condition":"invalid","message":"bad","is_sitting":true}]`,
+		`[null]`,
+		`[]`,
+		`{}`,
+		`[`,
+		`[{"timestamp":1,"condition":"is_dirty=false,is_overweight=false,is_broken=false"}] trailing`,
+		`[{"timestamp":"one","condition":"is_dirty=false,is_overweight=false,is_broken=false"}]`,
+	}
+	for _, body := range tests {
+		want, wantErr := referenceDecodeIncomingConditions([]byte(body))
+		got, gotErr := decodeIncomingConditions([]byte(body))
+		if (wantErr == nil) != (gotErr == nil) {
+			t.Fatalf("error compatibility differs for %q: reference=%v direct=%v", body, wantErr, gotErr)
+		}
+		if wantErr == nil && !reflect.DeepEqual(got, want) {
+			t.Fatalf("decoded %q as %#v, want %#v", body, got, want)
+		}
+	}
+}
+
+var benchmarkConditionBody = []byte(`[
+  {"timestamp":1620000000,"condition":"is_dirty=false,is_overweight=true,is_broken=false","message":"normal message","is_sitting":true},
+  {"timestamp":1620000001,"condition":"is_dirty=true,is_overweight=false,is_broken=true","message":"日本語 message","is_sitting":false},
+  {"timestamp":1620000002,"condition":"is_dirty=false,is_overweight=false,is_broken=false","message":"third","is_sitting":true},
+  {"timestamp":1620000003,"condition":"is_dirty=true,is_overweight=true,is_broken=true","message":"fourth","is_sitting":false}
+]`)
+
+func BenchmarkConditionDecoderReference(b *testing.B) {
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		if _, err := referenceDecodeIncomingConditions(benchmarkConditionBody); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkConditionDecoderDirect(b *testing.B) {
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		if _, err := decodeIncomingConditions(benchmarkConditionBody); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
