@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"reflect"
 	"strings"
@@ -355,6 +357,64 @@ func TestDirectConditionDecoderMatchesReference(t *testing.T) {
 	}
 }
 
+func TestConditionRequestBodyUsesBoundedPool(t *testing.T) {
+	body := []byte(`[{"timestamp":1,"condition":"is_dirty=false,is_overweight=false,is_broken=false","message":"ok","is_sitting":true}]`)
+	request, err := http.NewRequest(http.MethodPost, "/api/condition/test", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, pooled, err := readConditionRequestBody(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pooled == nil {
+		t.Fatal("small condition body did not use the pool")
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("body = %q, want %q", got, body)
+	}
+	releaseConditionRequestBuffer(pooled)
+
+	large := bytes.Repeat([]byte("x"), conditionRequestBufferSize+1)
+	request, err = http.NewRequest(http.MethodPost, "/api/condition/test", bytes.NewReader(large))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, pooled, err = readConditionRequestBody(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pooled != nil {
+		t.Fatal("large condition body unexpectedly used the pool")
+	}
+	if !bytes.Equal(got, large) {
+		t.Fatal("large fallback body differs")
+	}
+
+	request, err = http.NewRequest(http.MethodPost, "/api/condition/test", io.NopCloser(bytes.NewReader(body[:4])))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.ContentLength = int64(len(body))
+	if _, _, err = readConditionRequestBody(request); err == nil {
+		t.Fatal("truncated fixed-length body was accepted")
+	}
+}
+
+func TestDecodedConditionDoesNotAliasRequestBody(t *testing.T) {
+	body := []byte(`[{"timestamp":1,"condition":"is_dirty=false,is_overweight=false,is_broken=false","message":"persistent message","is_sitting":true}]`)
+	conditions, err := decodeIncomingConditions(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range body {
+		body[index] = 'x'
+	}
+	if got := conditions[0].Message; got != "persistent message" {
+		t.Fatalf("decoded message aliases request body: %q", got)
+	}
+}
+
 var benchmarkConditionBody = []byte(`[
   {"timestamp":1620000000,"condition":"is_dirty=false,is_overweight=true,is_broken=false","message":"normal message","is_sitting":true},
   {"timestamp":1620000001,"condition":"is_dirty=true,is_overweight=false,is_broken=true","message":"日本語 message","is_sitting":false},
@@ -376,6 +436,31 @@ func BenchmarkConditionDecoderDirect(b *testing.B) {
 	for index := 0; index < b.N; index++ {
 		if _, err := decodeIncomingConditions(benchmarkConditionBody); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkConditionRequestReadAll(b *testing.B) {
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		request := &http.Request{Body: io.NopCloser(bytes.NewReader(benchmarkConditionBody))}
+		if _, err := io.ReadAll(request.Body); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkConditionRequestPooled(b *testing.B) {
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		request := &http.Request{
+			Body:          io.NopCloser(bytes.NewReader(benchmarkConditionBody)),
+			ContentLength: int64(len(benchmarkConditionBody)),
+		}
+		if _, pooled, err := readConditionRequestBody(request); err != nil {
+			b.Fatal(err)
+		} else {
+			releaseConditionRequestBuffer(pooled)
 		}
 	}
 }

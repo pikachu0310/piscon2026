@@ -46,6 +46,7 @@ const (
 	scoreConditionLevelCritical = 1
 	trendCacheTTL               = 100 * time.Millisecond
 	conditionFlagSitting        = uint8(1 << 3)
+	conditionRequestBufferSize  = 2048
 )
 
 var (
@@ -120,7 +121,12 @@ var (
 	}
 
 	conditionWriteBarrier sync.RWMutex
+	conditionRequestPool  = sync.Pool{New: func() interface{} {
+		return new(conditionRequestBuffer)
+	}}
 )
+
+type conditionRequestBuffer [conditionRequestBufferSize]byte
 
 type Config struct {
 	Name string `db:"name"`
@@ -1032,6 +1038,27 @@ func decodeIncomingConditions(body []byte) ([]ForwardedCondition, error) {
 		return nil, fmt.Errorf("bad request body")
 	}
 	return conditions, nil
+}
+
+func readConditionRequestBody(request *http.Request) ([]byte, *conditionRequestBuffer, error) {
+	if request.ContentLength < 0 || request.ContentLength > conditionRequestBufferSize {
+		body, err := ioutil.ReadAll(request.Body)
+		return body, nil, err
+	}
+
+	buffer := conditionRequestPool.Get().(*conditionRequestBuffer)
+	body := buffer[:int(request.ContentLength)]
+	if _, err := io.ReadFull(request.Body, body); err != nil {
+		conditionRequestPool.Put(buffer)
+		return nil, nil, err
+	}
+	return body, buffer, nil
+}
+
+func releaseConditionRequestBuffer(buffer *conditionRequestBuffer) {
+	if buffer != nil {
+		conditionRequestPool.Put(buffer)
+	}
 }
 
 func encodeForwardedConditions(jiaIsuUUID string, conditions []ForwardedCondition) ([]byte, error) {
@@ -2372,11 +2399,12 @@ func postIsuCondition(c echo.Context) error {
 		defer registrationRequests.leave()
 	}
 
-	body, err := ioutil.ReadAll(c.Request().Body)
+	body, pooledBody, err := readConditionRequestBody(c.Request())
 	if err != nil {
 		return c.String(http.StatusBadRequest, "bad request body")
 	}
 	conditions, err := decodeIncomingConditions(body)
+	releaseConditionRequestBuffer(pooledBody)
 	if err != nil {
 		return c.String(http.StatusBadRequest, "bad request body")
 	}
