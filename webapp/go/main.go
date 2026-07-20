@@ -1312,6 +1312,123 @@ func decodeForwardedConditionBatch(body []byte) ([]string, [][]ForwardedConditio
 	return uuids, conditions, nil
 }
 
+func parseForwardedConditionBatchPayloads(body []byte, payloads *[conditionForwardBatchLimit][]byte) (int, error) {
+	if len(body) < 6 || string(body[:4]) != "ICB1" {
+		return 0, fmt.Errorf("invalid forwarded batch")
+	}
+	count := int(binary.LittleEndian.Uint16(body[4:]))
+	if count == 0 || count > len(payloads) {
+		return 0, fmt.Errorf("invalid forwarded batch count")
+	}
+	offset := 6
+	for index := 0; index < count; index++ {
+		if len(body)-offset < 4 {
+			return 0, fmt.Errorf("truncated forwarded batch")
+		}
+		payloadLength := uint64(binary.LittleEndian.Uint32(body[offset:]))
+		offset += 4
+		if payloadLength > uint64(len(body)-offset) {
+			return 0, fmt.Errorf("truncated forwarded payload")
+		}
+		payloadEnd := offset + int(payloadLength)
+		payloads[index] = body[offset:payloadEnd]
+		if err := validateForwardedConditionsBody(payloads[index]); err != nil {
+			return 0, err
+		}
+		offset = payloadEnd
+	}
+	if offset != len(body) {
+		return 0, fmt.Errorf("trailing forwarded batch data")
+	}
+	return count, nil
+}
+
+func validateForwardedConditionsBody(body []byte) error {
+	if len(body) < 10 || string(body[:4]) != "ICD1" {
+		return fmt.Errorf("invalid condition batch")
+	}
+	offset := 4
+	uuidLength := int(binary.LittleEndian.Uint16(body[offset:]))
+	offset += 2
+	if uuidLength == 0 || uuidLength > len(body)-offset-4 {
+		return fmt.Errorf("invalid condition UUID")
+	}
+	offset += uuidLength
+	conditionCount := uint64(binary.LittleEndian.Uint32(body[offset:]))
+	offset += 4
+	if conditionCount == 0 || conditionCount > uint64((len(body)-offset)/13) {
+		return fmt.Errorf("invalid condition count")
+	}
+	for index := uint64(0); index < conditionCount; index++ {
+		if len(body)-offset < 13 {
+			return fmt.Errorf("truncated condition")
+		}
+		offset += 9
+		messageLength := uint64(binary.LittleEndian.Uint32(body[offset:]))
+		offset += 4
+		if messageLength > uint64(len(body)-offset) {
+			return fmt.Errorf("truncated condition message")
+		}
+		offset += int(messageLength)
+	}
+	if offset != len(body) {
+		return fmt.Errorf("trailing condition data")
+	}
+	return nil
+}
+
+// applyEncodedForwardedConditions skips the allocation-heavy intermediate
+// []ForwardedCondition. The complete payload was structurally validated by
+// parseForwardedConditionBatchPayloads before any request in the batch is
+// applied, so these offset walks can focus on status semantics and compaction.
+func applyEncodedForwardedConditions(body []byte) (int, error) {
+	offset := 4
+	uuidLength := int(binary.LittleEndian.Uint16(body[offset:]))
+	offset += 2
+	jiaIsuUUID := string(body[offset : offset+uuidLength])
+	offset += uuidLength
+	conditionCount := int(binary.LittleEndian.Uint32(body[offset:]))
+	offset += 4
+	conditionsOffset := offset
+
+	conditionWriteBarrier.RLock()
+	defer conditionWriteBarrier.RUnlock()
+	state := currentConditionState()
+	known, err := isKnownIsu(jiaIsuUUID)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	if !known {
+		return http.StatusNotFound, nil
+	}
+
+	for index := 0; index < conditionCount; index++ {
+		offset += 8
+		flags := body[offset]
+		offset++
+		if flags > conditionFlagSitting|7 {
+			return http.StatusBadRequest, nil
+		}
+		messageLength := int(binary.LittleEndian.Uint32(body[offset:]))
+		offset += 4 + messageLength
+	}
+
+	compact := make([]CachedCondition, conditionCount)
+	offset = conditionsOffset
+	for index := 0; index < conditionCount; index++ {
+		compact[index].Timestamp = int64(binary.LittleEndian.Uint64(body[offset:]))
+		offset += 8
+		compact[index].Flags = body[offset]
+		offset++
+		messageLength := int(binary.LittleEndian.Uint32(body[offset:]))
+		offset += 4
+		compact[index].MessageID = internConditionMessage(state, string(body[offset:offset+messageLength]))
+		offset += messageLength
+	}
+	cacheConditionHistory(state, jiaIsuUUID, compact)
+	return http.StatusAccepted, nil
+}
+
 func encodeForwardedConditionStatuses(statuses []int) ([]byte, error) {
 	if len(statuses) == 0 || len(statuses) > int(^uint16(0)) {
 		return nil, fmt.Errorf("invalid forwarded status count")
@@ -1420,19 +1537,21 @@ func postForwardedConditionBatch(c echo.Context) error {
 	if err != nil {
 		return c.NoContent(http.StatusBadRequest)
 	}
-	uuids, conditionBatches, err := decodeForwardedConditionBatch(body)
-	releaseForwardBatchRequestBuffer(pooledBody)
+	var payloads [conditionForwardBatchLimit][]byte
+	count, err := parseForwardedConditionBatchPayloads(body, &payloads)
 	if err != nil {
+		releaseForwardBatchRequestBuffer(pooledBody)
 		return c.NoContent(http.StatusBadRequest)
 	}
-	statuses := make([]int, len(uuids))
-	for index := range uuids {
-		statuses[index], err = applyForwardedConditions(uuids[index], conditionBatches[index])
+	statuses := make([]int, count)
+	for index := 0; index < count; index++ {
+		statuses[index], err = applyEncodedForwardedConditions(payloads[index])
 		if err != nil {
 			c.Logger().Errorf("db error: %v", err)
 			statuses[index] = http.StatusInternalServerError
 		}
 	}
+	releaseForwardBatchRequestBuffer(pooledBody)
 	response, err := encodeForwardedConditionStatuses(statuses)
 	if err != nil {
 		return c.NoContent(http.StatusInternalServerError)

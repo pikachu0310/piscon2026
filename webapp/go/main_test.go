@@ -280,6 +280,23 @@ func TestForwardedConditionBatchCodecRoundTrip(t *testing.T) {
 			t.Fatalf("conditions[%d] = %#v, want %#v", index, conditions[index], requests[index].conditions)
 		}
 	}
+	var payloads [conditionForwardBatchLimit][]byte
+	count, err := parseForwardedConditionBatchPayloads(body, &payloads)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != len(requests) {
+		t.Fatalf("direct payload count = %d, want %d", count, len(requests))
+	}
+	for index := range requests {
+		uuid, decoded, decodeErr := decodeForwardedConditions(payloads[index])
+		if decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		if uuid != requests[index].jiaIsuUUID || !reflect.DeepEqual(decoded, requests[index].conditions) {
+			t.Fatalf("direct payload[%d] = %q %#v", index, uuid, decoded)
+		}
+	}
 
 	wantStatuses := []int{http.StatusAccepted, http.StatusNotFound, http.StatusInternalServerError}
 	statusBody, err := encodeForwardedConditionStatuses(wantStatuses)
@@ -331,6 +348,10 @@ func TestForwardedConditionBatchCodecRejectsCorruption(t *testing.T) {
 	for index, test := range [][]byte{nil, body[:len(body)-1], append(append([]byte{}, body...), 0)} {
 		if _, _, decodeErr := decodeForwardedConditionBatch(test); decodeErr == nil {
 			t.Fatalf("corrupt batch case %d was accepted", index)
+		}
+		var payloads [conditionForwardBatchLimit][]byte
+		if _, parseErr := parseForwardedConditionBatchPayloads(test, &payloads); parseErr == nil {
+			t.Fatalf("direct corrupt batch case %d was accepted", index)
 		}
 	}
 
@@ -622,6 +643,25 @@ func BenchmarkForwardBatchEncoderDirect(b *testing.B) {
 	b.ReportAllocs()
 	for index := 0; index < b.N; index++ {
 		if _, err := encodeForwardedConditionBatch(benchmarkForwardRequests); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkForwardBatchDecoderIntermediate(b *testing.B) {
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		if _, _, err := decodeForwardedConditionBatch(benchmarkForwardBatchBody); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkForwardBatchDecoderDirect(b *testing.B) {
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		var payloads [conditionForwardBatchLimit][]byte
+		if _, err := parseForwardedConditionBatchPayloads(benchmarkForwardBatchBody, &payloads); err != nil {
 			b.Fatal(err)
 		}
 	}
