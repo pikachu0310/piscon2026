@@ -874,3 +874,10 @@ slow/access/pprof/fgprof/OS計測だけを根拠に次の改善を選ぶ。
 - vendor JSは743,417 bytesのまま1runに1,314〜1,458回配信され、E50/E51では約0.98〜1.08GBを占め、平均202〜221ms、p95 638〜763msだった。s1はCPUが約45%使われ、平均約49MB/sを送信している一方、同じassetには207,404-byteの正しい`.gz`が初期imageから存在する。
 - Nginxは`http_gzip_static_module`を備えているため、asset locationで`gzip_static on`を有効にする。アプリやAPI responseは圧縮せず、`Accept-Encoding: gzip`を送るclientだけに事前圧縮済みassetを返す。
 - deploy前後で元fileとgzip展開後のSHA-256一致、gzipあり/なしのContent-Length・Content-Encoding・ETag、304応答、Nginx config testを確認する。公式validを保ち、vendor送信byte、p50/p95、s1 network/system CPU、登録成功、scoreが改善すれば採用する。validator不一致、5xx、またはvendorの直接指標が改善しなければ無効化する。
+
+### E52 first result / repeat expectation
+
+- 公式benchmark `449bd3f0-b09d-4fa0-aea2-839111255efa`は122,381点、PASSED、減点0、timeout 330。計測runは`20260720T041155.933120Z-s1-7139db`で、全hostが`ANALYZED`、全`errors.txt`は空だった。
+- 元fileとgzip展開後のSHA-256はともに`5691d088800fc9a357fa69b31d15e7a9618d17f749eab4c9e5b06d0eaa224c1a`。gzip clientは`Content-Encoding: gzip`と207,404-byte response、identity clientは743,417-byte response、gzip ETagの再検証は304を返した。
+- ベンチ中もvendor JS全1,281件が207,404 bytesで配信され、Nginx access timeは平均/p95とも0msになった。s1の平均TXはE51の47,057→31,576KB/s、system CPUは22.68→19.79%へ低下し、圧縮の直接指標は大幅に改善した。
+- 一方、登録成功はE51の908→881、condition 202は243,911→222,484、scoreは138,586→122,381へ悪化した。静的配信改善と負荷生成量低下が逆方向なので、同じapp/configをもう一度測る。vendor byte/host負荷改善を再現しつつ登録・condition・scoreが回復すれば採用し、再び明確に悪化すればclient側の展開負荷またはrun開始挙動への副作用として棄却する。
