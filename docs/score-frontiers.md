@@ -2,17 +2,17 @@
 
 ## Score champion
 
-- Status: B5 validated
-- Commit: `f254b4c`
+- Status: B6 validated
+- Commit: `6ee2209` (App source `f254b4c` plus B0-style Nginx delivery)
 - Topology declaration: s1=Nginx, s2=MariaDB, s3=Go App
-- Benchmark ID / score / validity: `1d79911c-53b2-4613-8316-88e2b990697b`,
-  **134,561**, PASSED, deduction 0
-- Artifact: `20260720T102008.890588Z-s1-4fc66b`
+- Benchmark ID / score / validity: `43a8ea3f-ffec-4e5e-bc1e-bb547653308b`,
+  **142,430**, PASSED, deduction 0
+- Artifact: `20260720T102755.490389Z-s1-57d2f2`
 - Deployed app source provenance: `f254b4c`
-- B5 App binary SHA-256: `0c24a8b285540e7be86e95f1cc86728f743e98f8ab8b74513dff849dcbf2f72f`
-- B5 Nginx main SHA-256: `67112cca9ad9a60a196df50a6819e7c1a9ca53ef99eb731f502a70a0056071f5`
-- B5 Nginx site SHA-256: `9ad5ce44a6e0417c104b8db6605a08c64a2a9ec6debd59a0b30a818b432e81af`
-- B5 topology SHA-256: `d399071c8ed066d29ce9e942d3a604cd823b6c1151bb885c89c76fe4987fbc24`
+- B6 App binary SHA-256: `0c24a8b285540e7be86e95f1cc86728f743e98f8ab8b74513dff849dcbf2f72f`
+- B6 Nginx main SHA-256: `10cb2bce3bb674077c960f0a3910972d7184b97cec111669e40dab64514328b9`
+- B6 Nginx site SHA-256: `9ad5ce44a6e0417c104b8db6605a08c64a2a9ec6debd59a0b30a818b432e81af`
+- B6 topology SHA-256: `d399071c8ed066d29ce9e942d3a604cd823b6c1151bb885c89c76fe4987fbc24`
 - s2 MariaDB tuning SHA-256: `b7462f1f41615fa7a733871d2aed3969973708e02497d0f5526e8e4e10ea31af`
 - B0 remains fully restorable from the earlier manifest and the server-side
   `/home/isucon/score-champion-b0` config backup.
@@ -56,6 +56,14 @@
 - Condition 499: 3,073 -> 71
 - Decision: structural capacity frontier promoted to score champion. Continue
   feeding the freed capacity via client-arrival and registration experiments.
+
+### B6: compact state with restored client demand (`6ee2209`)
+
+- Score: 142,430, PASSED, deduction 0 (new champion)
+- Registration success: 896; condition 202: 246,225
+- Condition 499: 544, still 82.3% below B0
+- Decision: compact state is now converted into official score. This exact
+  App/config combination is the rollback target for topology experiments.
 
 ## Decision rule
 

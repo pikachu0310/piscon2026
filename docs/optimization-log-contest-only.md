@@ -25,6 +25,7 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 | B3 | 18:55 | `da4fd9a` | Precompress immutable assets and serve with `gzip_static` | Same wire reduction as B2 without runtime compression | portal `af7892ca-48a7-4925-8247-dd5103111a1b`; artifact `20260720T095553.416750Z-s1-92e3b8` | 125,165, PASSED, deduction 0 | Capacity-frontier candidate; repeat before decision |
 | B4 | 18:59 | `da4fd9a` | Exact repeat of B3 | Separate benchmark variance from static-compression mechanism | portal `926d9431-620d-4454-853d-4096d56eedba`; artifact `20260720T095959.518837Z-s1-a49d6d` | 128,296, PASSED, deduction 0 | Capacity frontier confirmed; not score champion |
 | B5 | 19:20 | `f254b4c` | Compact generation-scoped condition state on the B3/B4 precompressed ingress | Heap proved 74% of retained memory was history; shrink each entry from 48 to 16 bytes and remove pointer scanning | portal `1d79911c-53b2-4613-8316-88e2b990697b`; artifact `20260720T102008.890588Z-s1-4fc66b` | **134,561**, PASSED, deduction 0 | New score champion and strong capacity frontier |
+| B6 | 19:27 | `6ee2209` | Keep compact state but restore B0 uncompressed client delivery | B5 freed App capacity but precompression reduced registration arrivals; feed the frontier with B0 ingress behavior | portal `43a8ea3f-ffec-4e5e-bc1e-bb547653308b`; artifact `20260720T102755.490389Z-s1-57d2f2` | **142,430**, PASSED, deduction 0 | New score champion; compact state converts to score when demand is restored |
 
 ### B0 facts
 
@@ -104,6 +105,19 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 - This is both score champion and a much stronger capacity platform. B6 removes
   precompression while keeping compact state to feed the saved capacity with
   the B0 client-arrival behavior.
+
+### B6 decision: demand plus compact capacity converted to score
+
+- Registration success reached 896 (B0 893) and condition 202 reached 246,225
+  (B0 243,741). Condition 499 remained only 544 versus B0's 3,073.
+- Official score rose to 142,430 (+6.0% over B0). App CPU was 32.26 seconds
+  while doing more valid work; history remained compact.
+- Compression was not the useful production setting on this workload: network
+  was not the gating resource and compressed client handling reduced arrivals.
+  B6's uncompressed ingress plus compact state becomes the score champion.
+- The next structural family is node topology: move registration's external
+  wait and image body retention to idle s2 while keeping condition ownership on
+  s3, with DB fallback on a known-UUID cache miss.
 
 ## Four current-system maps
 
