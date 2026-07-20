@@ -126,6 +126,17 @@ work to move saturation downstream.
 - Decision: **current overall capacity/correctness champion** and the base for
   further experiments. B9 remains separately restorable as scalar champion.
 
+### B12: exact batched-edge repeat (`eeafca4` intent, B11 effective)
+
+- Score: 151,449, PASSED, deduction 0
+- Accepted work: 245,775 condition 202 (the highest single-run condition count
+  so far), 944 registration 201, 25,582 trend 200 and 24,731 condition-read 200
+- Deployment evidence: all 261,883 condition attempts still used s2; the
+  intended weighted upstream existed only in `sites-available`, while the
+  active `sites-enabled` path was an independent regular file
+- Decision: retained as a B11 repeat and condition-ingest frontier, not labeled
+  as evidence for or against load balancing. B13 is the corrected experiment.
+
 ## Decision rule
 
 Every run is judged on five axes:

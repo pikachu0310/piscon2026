@@ -31,6 +31,7 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 | B9 | 20:07 | `9d025e4` | Terminate external condition bodies on s2 and synchronously forward a compact private format to authoritative state on s3 | B8 left s2 81% idle while s3 spent 5.27 CPU-seconds and about 2,700 goroutine-seconds in condition handling/body reads | portal `f8ee8044-c525-4eaa-9a3d-a9af2cf51953`; artifact `20260720T110736.312178Z-s1-18f414` | **160,102**, PASSED, deduction 6 | New score champion, but deliberately overloaded edge is not the condition-capacity frontier; fix registration placement and synchronous fan-out |
 | B10 | 20:13 | `e8d6467` | Keep the condition edge on s2 but route registration back to newly freed s3 | B9 colocated registration with the saturated edge and produced 779 registration 499s plus seven 500/502 responses | portal `40713158-859f-4ba4-a1bb-dc2cb68def5d`; artifact `20260720T111323.749645Z-s1-816101` | 147,446, PASSED, deduction 0 | Stronger total-work/correctness frontier: 999 registrations and more condition 202, but less read work than B9; batch the private hop next |
 | B11 | 20:20 | `3f0fc62` | Keep B10 routing and batch up to 64 already-queued compact condition updates behind eight edge workers | B10 spent 52.98 edge CPU-seconds while synchronously forwarding each accepted body and returned about 118k condition 499s | portal `cf2f1369-52fb-43a3-9965-26b1fcc7cf24`; artifact `20260720T112047.518093Z-s1-cc4808` | **156,224**, PASSED, deduction 0 | New overall capacity/correctness champion: near-score-champion result while accepting 2.41x B9 condition writes at much lower CPU cost |
+| B12 | 20:34 | `eeafca4` intent, B11 effective | Intended 3:1 split of condition ingress across s2 and s3 | Validate deployment from captured `upstream_addr`, not only repository diff and `nginx -t` | portal `dd5e2228-86d9-496a-afa1-6416f3bce7ed`; artifact `20260720T113448.928674Z-s1-0e9c09` | **151,449**, PASSED, deduction 0 | Valid B11 repeat and new condition-ingest count frontier; not a split experiment because all 261,883 condition attempts still reached s2 |
 
 ### B0 facts
 
@@ -201,6 +202,24 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 - This run demonstrates why a lower score is not automatically a regression.
   B9 remains the scalar score champion at 160,102, while B11 is promoted to the
   overall capacity/correctness champion and the base for subsequent work.
+
+### B12 decision: a useful repeat exposed a deployment false assumption
+
+- B12 accepted 245,775 condition writes, 944 registrations, 25,582 trend reads
+  and 24,731 condition reads. Its 151,449 score is lower than B11, but the run
+  independently reproduces the batched edge's high write capacity and slightly
+  exceeds B11's condition 202 count.
+- The intended weighted split did not execute. Every one of 261,883 condition
+  attempts had `upstream_addr=10.0.0.143:3000`. s2 and s3 CPU consequently
+  stayed close to B11 at 41.95 and 24.14 sampled seconds.
+- The cause was operational, not algorithmic: the active
+  `/etc/nginx/sites-enabled/isucondition.conf` is a regular file rather than a
+  symlink. Deploying only the
+  `sites-available` copy passed `nginx -t` and the generic doctor checks but did
+  not change the loaded server block.
+- The active file is now backed up with the B11 champion, both copies receive
+  the weighted config, and `nginx -T` plus eight loopback requests confirm an
+  exact 6:2 s2:s3 split. The first actual split run is B13.
 
 ## Four current-system maps
 
