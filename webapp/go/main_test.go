@@ -177,3 +177,41 @@ func TestRegistrationRequestGateDrainsAndReopens(t *testing.T) {
 		t.Fatal("opened gate did not accept a new request")
 	}
 }
+
+func TestForwardedConditionCodecRoundTrip(t *testing.T) {
+	wantUUID := "01234567-89ab-cdef-0123-456789abcdef"
+	wantConditions := []ForwardedCondition{
+		{Timestamp: -1, Message: "", Flags: 0},
+		{Timestamp: 1620000000, Message: "日本語とemoji 🪑", Flags: 15},
+		{Timestamp: 1620000001, Message: "invalid marker", Flags: 0xff},
+	}
+	body, err := encodeForwardedConditions(wantUUID, wantConditions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotUUID, gotConditions, err := decodeForwardedConditions(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotUUID != wantUUID || !reflect.DeepEqual(gotConditions, wantConditions) {
+		t.Fatalf("round trip mismatch: uuid=%q conditions=%#v", gotUUID, gotConditions)
+	}
+}
+
+func TestForwardedConditionCodecRejectsCorruption(t *testing.T) {
+	body, err := encodeForwardedConditions("uuid", []ForwardedCondition{{Timestamp: 1, Message: "message", Flags: 3}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := [][]byte{
+		nil,
+		[]byte("ICD0"),
+		body[:len(body)-1],
+		append(append([]byte{}, body...), 0),
+	}
+	for index, test := range tests {
+		if _, _, decodeErr := decodeForwardedConditions(test); decodeErr == nil {
+			t.Fatalf("corrupt case %d was accepted", index)
+		}
+	}
+}

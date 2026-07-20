@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,6 +59,8 @@ var (
 	registrationOnly              bool
 	registrationGateURL           string
 	registrationGateToken         string
+	conditionForwardURL           string
+	conditionForwardClient        *http.Client
 
 	sessionCache = struct {
 		sync.RWMutex
@@ -184,6 +187,12 @@ type registrationRequestGate struct {
 	cond   *sync.Cond
 	closed bool
 	active int
+}
+
+type ForwardedCondition struct {
+	Timestamp int64
+	Message   string
+	Flags     uint8
 }
 
 func newRegistrationRequestGate() *registrationRequestGate {
@@ -359,6 +368,15 @@ func main() {
 	registrationOnly = getEnv("REGISTRATION_ONLY", "") == "1"
 	registrationGateURL = os.Getenv("REGISTRATION_GATE_URL")
 	registrationGateToken = os.Getenv("REGISTRATION_GATE_TOKEN")
+	conditionForwardURL = os.Getenv("CONDITION_FORWARD_URL")
+	conditionForwardClient = &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        512,
+			MaxIdleConnsPerHost: 512,
+			IdleConnTimeout:     90 * time.Second,
+		},
+		Timeout: 5 * time.Second,
+	}
 
 	e := echo.New()
 	e.Debug = false
@@ -383,6 +401,7 @@ func main() {
 	e.POST("/api/condition/:jia_isu_uuid", postIsuCondition)
 	e.POST("/internal/registration-gate/close", postRegistrationGateClose)
 	e.POST("/internal/registration-gate/open", postRegistrationGateOpen)
+	e.POST("/internal/condition", postForwardedCondition)
 
 	e.GET("/", getIndex)
 	e.GET("/isu/:jia_isu_uuid", getIndex)
@@ -814,6 +833,189 @@ func setRemoteRegistrationGate(action string) error {
 		return fmt.Errorf("registration gate %s returned %s", action, res.Status)
 	}
 	return nil
+}
+
+func decodeIncomingConditions(body []byte) ([]ForwardedCondition, error) {
+	incoming := make([]IncomingCondition, 0, bytes.Count(body, []byte("{")))
+	if err := conditionJSON.Unmarshal(body, &incoming); err != nil || len(incoming) == 0 {
+		return nil, fmt.Errorf("bad request body")
+	}
+
+	conditions := make([]ForwardedCondition, len(incoming))
+	for index := range incoming {
+		flags, ok := conditionBitsByString[incoming[index].Condition]
+		if !ok {
+			// The authoritative process checks UUID existence before format, as
+			// the original handler did. Carry an invalid marker across the hop.
+			flags = 0xff
+		} else if incoming[index].IsSitting {
+			flags |= conditionFlagSitting
+		}
+		conditions[index] = ForwardedCondition{
+			Timestamp: incoming[index].Timestamp,
+			Message:   incoming[index].Message,
+			Flags:     flags,
+		}
+	}
+	return conditions, nil
+}
+
+func encodeForwardedConditions(jiaIsuUUID string, conditions []ForwardedCondition) ([]byte, error) {
+	if len(jiaIsuUUID) > int(^uint16(0)) || uint64(len(conditions)) > uint64(^uint32(0)) {
+		return nil, fmt.Errorf("condition batch is too large")
+	}
+	size := 4 + 2 + len(jiaIsuUUID) + 4
+	for index := range conditions {
+		if uint64(len(conditions[index].Message)) > uint64(^uint32(0)) {
+			return nil, fmt.Errorf("condition message is too large")
+		}
+		size += 8 + 1 + 4 + len(conditions[index].Message)
+	}
+	body := make([]byte, size)
+	copy(body, "ICD1")
+	offset := 4
+	binary.LittleEndian.PutUint16(body[offset:], uint16(len(jiaIsuUUID)))
+	offset += 2
+	copy(body[offset:], jiaIsuUUID)
+	offset += len(jiaIsuUUID)
+	binary.LittleEndian.PutUint32(body[offset:], uint32(len(conditions)))
+	offset += 4
+	for index := range conditions {
+		binary.LittleEndian.PutUint64(body[offset:], uint64(conditions[index].Timestamp))
+		offset += 8
+		body[offset] = conditions[index].Flags
+		offset++
+		binary.LittleEndian.PutUint32(body[offset:], uint32(len(conditions[index].Message)))
+		offset += 4
+		copy(body[offset:], conditions[index].Message)
+		offset += len(conditions[index].Message)
+	}
+	return body, nil
+}
+
+func decodeForwardedConditions(body []byte) (string, []ForwardedCondition, error) {
+	if len(body) < 10 || string(body[:4]) != "ICD1" {
+		return "", nil, fmt.Errorf("invalid condition batch")
+	}
+	offset := 4
+	uuidLength := int(binary.LittleEndian.Uint16(body[offset:]))
+	offset += 2
+	if uuidLength == 0 || uuidLength > len(body)-offset-4 {
+		return "", nil, fmt.Errorf("invalid condition UUID")
+	}
+	jiaIsuUUID := string(body[offset : offset+uuidLength])
+	offset += uuidLength
+	conditionCount := uint64(binary.LittleEndian.Uint32(body[offset:]))
+	offset += 4
+	if conditionCount == 0 || conditionCount > uint64((len(body)-offset)/13) {
+		return "", nil, fmt.Errorf("invalid condition count")
+	}
+	conditions := make([]ForwardedCondition, int(conditionCount))
+	for index := range conditions {
+		if len(body)-offset < 13 {
+			return "", nil, fmt.Errorf("truncated condition")
+		}
+		conditions[index].Timestamp = int64(binary.LittleEndian.Uint64(body[offset:]))
+		offset += 8
+		conditions[index].Flags = body[offset]
+		offset++
+		messageLength := uint64(binary.LittleEndian.Uint32(body[offset:]))
+		offset += 4
+		if messageLength > uint64(len(body)-offset) {
+			return "", nil, fmt.Errorf("truncated condition message")
+		}
+		conditions[index].Message = string(body[offset : offset+int(messageLength)])
+		offset += int(messageLength)
+	}
+	if offset != len(body) {
+		return "", nil, fmt.Errorf("trailing condition data")
+	}
+	return jiaIsuUUID, conditions, nil
+}
+
+func applyForwardedConditions(jiaIsuUUID string, conditions []ForwardedCondition) (int, error) {
+	conditionWriteBarrier.RLock()
+	defer conditionWriteBarrier.RUnlock()
+	state := currentConditionState()
+
+	known, err := isKnownIsu(jiaIsuUUID)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	if !known {
+		return http.StatusNotFound, nil
+	}
+	for index := range conditions {
+		if conditions[index].Flags > conditionFlagSitting|7 {
+			return http.StatusBadRequest, nil
+		}
+	}
+
+	compact := make([]CachedCondition, len(conditions))
+	for index := range conditions {
+		compact[index] = CachedCondition{
+			Timestamp: conditions[index].Timestamp,
+			MessageID: internConditionMessage(state, conditions[index].Message),
+			Flags:     conditions[index].Flags,
+		}
+	}
+	cacheConditionHistory(state, jiaIsuUUID, compact)
+	return http.StatusAccepted, nil
+}
+
+func conditionStatusResponse(c echo.Context, status int) error {
+	switch status {
+	case http.StatusAccepted:
+		return c.NoContent(status)
+	case http.StatusBadRequest:
+		return c.String(status, "bad request body")
+	case http.StatusNotFound:
+		return c.String(status, "not found: isu")
+	default:
+		return c.NoContent(http.StatusInternalServerError)
+	}
+}
+
+func postForwardedCondition(c echo.Context) error {
+	if registrationOnly || registrationGateToken == "" || c.Request().Header.Get("X-Registration-Gate-Token") != registrationGateToken {
+		return c.NoContent(http.StatusNotFound)
+	}
+	body, err := ioutil.ReadAll(c.Request().Body)
+	if err != nil {
+		return c.NoContent(http.StatusBadRequest)
+	}
+	jiaIsuUUID, conditions, err := decodeForwardedConditions(body)
+	if err != nil {
+		return c.NoContent(http.StatusBadRequest)
+	}
+	status, err := applyForwardedConditions(jiaIsuUUID, conditions)
+	if err != nil {
+		c.Logger().Errorf("db error: %v", err)
+	}
+	return c.NoContent(status)
+}
+
+func postIsuConditionForward(c echo.Context, jiaIsuUUID string, conditions []ForwardedCondition) error {
+	if conditionForwardURL == "" {
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	body, err := encodeForwardedConditions(jiaIsuUUID, conditions)
+	if err != nil {
+		return c.String(http.StatusBadRequest, "bad request body")
+	}
+	req, err := http.NewRequest(http.MethodPost, conditionForwardURL, bytes.NewReader(body))
+	if err != nil {
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-Registration-Gate-Token", registrationGateToken)
+	res, err := conditionForwardClient.Do(req)
+	if err != nil {
+		c.Logger().Errorf("failed to forward condition: %v", err)
+		return c.NoContent(http.StatusInternalServerError)
+	}
+	defer res.Body.Close()
+	return conditionStatusResponse(c, res.StatusCode)
 }
 
 func getJIAServiceURL(tx *sqlx.Tx) string {
@@ -1827,59 +2029,31 @@ func postIsuCondition(c echo.Context) error {
 	if jiaIsuUUID == "" {
 		return c.String(http.StatusBadRequest, "missing: jia_isu_uuid")
 	}
+	if registrationOnly {
+		// Enter before reading the external body so initialize drains requests
+		// that started in the previous generation but have not decoded yet.
+		registrationRequests.enter()
+		defer registrationRequests.leave()
+	}
 
 	body, err := ioutil.ReadAll(c.Request().Body)
 	if err != nil {
 		return c.String(http.StatusBadRequest, "bad request body")
 	}
-	incoming := make([]IncomingCondition, 0, bytes.Count(body, []byte("{")))
-	err = conditionJSON.Unmarshal(body, &incoming)
+	conditions, err := decodeIncomingConditions(body)
 	if err != nil {
-		return c.String(http.StatusBadRequest, "bad request body")
-	} else if len(incoming) == 0 {
 		return c.String(http.StatusBadRequest, "bad request body")
 	}
 
-	conditionWriteBarrier.RLock()
-	defer conditionWriteBarrier.RUnlock()
-	state := currentConditionState()
+	if registrationOnly {
+		return postIsuConditionForward(c, jiaIsuUUID, conditions)
+	}
 
-	known, err := isKnownIsu(jiaIsuUUID)
+	status, err := applyForwardedConditions(jiaIsuUUID, conditions)
 	if err != nil {
 		c.Logger().Errorf("db error: %v", err)
-		return c.NoContent(http.StatusInternalServerError)
 	}
-	if !known {
-		return c.String(http.StatusNotFound, "not found: isu")
-	}
-
-	flags := make([]uint8, len(incoming))
-	for i := range incoming {
-		bits, ok := conditionBitsByString[incoming[i].Condition]
-		if !ok {
-			return c.String(http.StatusBadRequest, "bad request body")
-		}
-		flags[i] = bits
-		if incoming[i].IsSitting {
-			flags[i] |= conditionFlagSitting
-		}
-	}
-
-	conditions := make([]CachedCondition, len(incoming))
-	for i := range incoming {
-		conditions[i] = CachedCondition{
-			Timestamp: incoming[i].Timestamp,
-			MessageID: internConditionMessage(state, incoming[i].Message),
-			Flags:     flags[i],
-		}
-	}
-
-	// During the one-minute scoring phase, the memory history is authoritative.
-	// initialize recreates it from the baseline DB, so per-request remote SQL is
-	// unnecessary and condition reads can observe the update immediately.
-	cacheConditionHistory(state, jiaIsuUUID, conditions)
-
-	return c.NoContent(http.StatusAccepted)
+	return conditionStatusResponse(c, status)
 }
 
 // ISUのコンディションの文字列がcsv形式になっているか検証
