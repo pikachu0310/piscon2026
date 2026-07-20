@@ -313,6 +313,17 @@ work to move saturation downstream.
   B33 exceeds B30's valid work while spending 8.6% less App CPU. Preserve B13
   independently as the scalar-score/final rollback candidate.
 
+## Unvalidated work after the last official run
+
+- B34/B35 are score-0 `PREPARE` errors. s1 received no request, so they do not
+  measure the temporary 3:1 routing change and are excluded from all frontiers.
+- `9438d09` removes the private intermediate decode allocation and was deployed
+  on the restored 2:1 base, but the portal closed before an official run.
+- `9af19c5` removes the following compact-history copy/growth costs; it passed
+  normal, race and target Go 1.16 tests but was not deployed.
+- These commits remain hypotheses only. The last validated live point is B33;
+  the score rollback remains the separately backed-up B13 configuration.
+
 ## Decision rule
 
 Every run is judged on five axes:

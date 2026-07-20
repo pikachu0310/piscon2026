@@ -650,3 +650,30 @@ if their first official score is flat or lower.
   3:1. B13 proved this ratio can feed more work, while the current edge is much
   cheaper than B13's implementation. Judge the run on routing, valid work,
   per-node CPU, queue depth and read tails as well as score.
+
+### 22:35--23:00 JST: portal failure and the missed retest freeze
+
+- B34/B35 attempted the 3:1 ingress experiment, but both portal records ended
+  immediately at `PREPARE` with score 0. No request reached s1 and no capture
+  started, so these are portal/infrastructure errors, not evidence about 3:1.
+- The ratio was restored to B33's 2:1 base. Commit `9438d09` then replaced the
+  private batch's intermediate `[]ForwardedCondition` decode with a validated
+  direct parser. Local Go 1.24 tests/race and target Go 1.16 tests passed; the
+  64-request structural parser changed from about 9.6--10.6 us, 17,792 B and
+  386 allocations to 0.67--0.75 us, zero bytes and zero allocations.
+- The direct parser was deployed after B35, but **never received an official
+  benchmark**. Commit `9af19c5` additionally appends compact history entries in
+  place and preallocates 2,048 entries per active history; it passed local and
+  target tests but was **not deployed**. Neither commit is a promoted frontier.
+- At 23:00 the portal instance list became empty, benchmark targets were
+  disabled and ranking changed to its final view. The participant document
+  states that retest began at **2026-07-20 22:00 JST** and that server access
+  during it could interfere with the retest. Work should therefore have frozen
+  before 22:00, regardless of the requested ten-hour goal duration.
+- Server mutation and measurement stopped immediately after discovering the
+  schedule. This incident exposes a missing invariant in the agent contract:
+  read and record contest end/portal/retest deadlines before the first change,
+  derive a hard freeze, and let that freeze override elapsed-hour/run targets.
+- Last officially validated experiment remains B33: 149,955, PASSED,
+  deduction 0. Session score champion remains B13: 162,980, PASSED,
+  deduction 0. B34/B35 and the unmeasured commits must not replace either.
