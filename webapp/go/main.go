@@ -132,6 +132,9 @@ var (
 	forwardBatchRequestPool = sync.Pool{New: func() interface{} {
 		return new(forwardBatchRequestBuffer)
 	}}
+	conditionForwardBatchCount   uint64
+	conditionForwardRequestCount uint64
+	conditionForwardMaxBatch     uint64
 )
 
 type conditionRequestBuffer [conditionRequestBufferSize]byte
@@ -217,6 +220,51 @@ type conditionForwardRequest struct {
 	jiaIsuUUID string
 	conditions []ForwardedCondition
 	result     chan int
+}
+
+type ConditionForwardStats struct {
+	Batches       uint64  `json:"batches"`
+	Requests      uint64  `json:"requests"`
+	MaxBatch      uint64  `json:"max_batch"`
+	AverageBatch  float64 `json:"average_batch"`
+	QueueDepth    int     `json:"queue_depth"`
+	QueueCapacity int     `json:"queue_capacity"`
+}
+
+func resetConditionForwardStats() {
+	atomic.StoreUint64(&conditionForwardBatchCount, 0)
+	atomic.StoreUint64(&conditionForwardRequestCount, 0)
+	atomic.StoreUint64(&conditionForwardMaxBatch, 0)
+}
+
+func recordConditionForwardBatch(size int) {
+	atomic.AddUint64(&conditionForwardBatchCount, 1)
+	atomic.AddUint64(&conditionForwardRequestCount, uint64(size))
+	for {
+		current := atomic.LoadUint64(&conditionForwardMaxBatch)
+		if uint64(size) <= current || atomic.CompareAndSwapUint64(&conditionForwardMaxBatch, current, uint64(size)) {
+			return
+		}
+	}
+}
+
+func currentConditionForwardStats() ConditionForwardStats {
+	batches := atomic.LoadUint64(&conditionForwardBatchCount)
+	requests := atomic.LoadUint64(&conditionForwardRequestCount)
+	average := 0.0
+	if batches != 0 {
+		average = float64(requests) / float64(batches)
+	}
+	queueDepth, queueCapacity := 0, 0
+	if conditionForwardQueue != nil {
+		queueDepth = len(conditionForwardQueue)
+		queueCapacity = cap(conditionForwardQueue)
+	}
+	return ConditionForwardStats{
+		Batches: batches, Requests: requests,
+		MaxBatch: atomic.LoadUint64(&conditionForwardMaxBatch), AverageBatch: average,
+		QueueDepth: queueDepth, QueueCapacity: queueCapacity,
+	}
 }
 
 func acquireConditionForwardRequest(jiaIsuUUID string, conditions []ForwardedCondition) *conditionForwardRequest {
@@ -964,6 +1012,7 @@ func postRegistrationGateClose(c echo.Context) error {
 		return c.NoContent(http.StatusNotFound)
 	}
 	registrationRequests.closeAndDrain()
+	resetConditionForwardStats()
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -1413,6 +1462,7 @@ func conditionForwardWorker() {
 }
 
 func forwardConditionBatch(requests []*conditionForwardRequest) []int {
+	recordConditionForwardBatch(len(requests))
 	statuses := make([]int, len(requests))
 	for index := range statuses {
 		statuses[index] = http.StatusInternalServerError

@@ -110,6 +110,7 @@ func startDiagnosticsServer(logger echo.Logger) {
 	mux.HandleFunc("/debug/fgprof", fgprofHandler)
 	mux.HandleFunc("/debug/runtime-metrics", runtimeMetricsHandler)
 	mux.HandleFunc("/debug/db-stats", dbStatsHandler)
+	mux.HandleFunc("/debug/condition-forward-stats", conditionForwardStatsHandler)
 	mux.HandleFunc("/debug/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte("{\"status\":\"ok\"}\n"))
@@ -128,6 +129,10 @@ func startDiagnosticsServer(logger echo.Logger) {
 			logger.Errorf("diagnostics server failed: %v", err)
 		}
 	}()
+}
+
+func conditionForwardStatsHandler(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, currentConditionForwardStats())
 }
 
 func getEnvInt(key string, defaultValue int) int {

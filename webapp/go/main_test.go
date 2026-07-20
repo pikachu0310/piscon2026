@@ -202,6 +202,18 @@ func TestRegistrationRequestGateDrainsAndReopens(t *testing.T) {
 	}
 }
 
+func TestConditionForwardStats(t *testing.T) {
+	resetConditionForwardStats()
+	recordConditionForwardBatch(1)
+	recordConditionForwardBatch(4)
+	recordConditionForwardBatch(conditionForwardBatchLimit)
+	stats := currentConditionForwardStats()
+	if stats.Batches != 3 || stats.Requests != 69 || stats.MaxBatch != conditionForwardBatchLimit || stats.AverageBatch != 23 {
+		t.Fatalf("unexpected forward stats: %#v", stats)
+	}
+	resetConditionForwardStats()
+}
+
 func TestForwardedConditionCodecRoundTrip(t *testing.T) {
 	wantUUID := "01234567-89ab-cdef-0123-456789abcdef"
 	wantConditions := []ForwardedCondition{
