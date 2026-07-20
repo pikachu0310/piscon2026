@@ -29,6 +29,7 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 | B7 | 19:47 | `bb0d619` | Route only registration POSTs to a registration-only App colocated with MariaDB on s2 | Registration spends almost all wall time waiting for JIA while s2 is about 83% idle; isolate that wait from condition ownership on s3 | portal `58cf5dbc-634a-447e-bf6d-d3bb1829b98a`; artifact `20260720T104747.088972Z-s1-fd5739` | 134,195, PASSED, deduction 0 | Correct topology, not a work frontier on this run; repeat with both App profiles enabled |
 | B8 | 19:53 | `bb0d619` | Exact B7 repeat after enabling s2 CPU pprof and fgprof capture | Distinguish benchmark/JIA variance and measure the actual registration-only process | portal `14708ae4-ef0c-40c5-b62d-2bead6c3cf86`; artifact `20260720T105336.406228Z-s1-53128e` | 136,587, PASSED, deduction 0 | Registration 201 exceeds B6, but condition 202 falls; retain as an isolation frontier, not score champion |
 | B9 | 20:07 | `9d025e4` | Terminate external condition bodies on s2 and synchronously forward a compact private format to authoritative state on s3 | B8 left s2 81% idle while s3 spent 5.27 CPU-seconds and about 2,700 goroutine-seconds in condition handling/body reads | portal `f8ee8044-c525-4eaa-9a3d-a9af2cf51953`; artifact `20260720T110736.312178Z-s1-18f414` | **160,102**, PASSED, deduction 6 | New score champion, but deliberately overloaded edge is not the condition-capacity frontier; fix registration placement and synchronous fan-out |
+| B10 | 20:13 | `e8d6467` | Keep the condition edge on s2 but route registration back to newly freed s3 | B9 colocated registration with the saturated edge and produced 779 registration 499s plus seven 500/502 responses | portal `40713158-859f-4ba4-a1bb-dc2cb68def5d`; artifact `20260720T111323.749645Z-s1-816101` | 147,446, PASSED, deduction 0 | Stronger total-work/correctness frontier: 999 registrations and more condition 202, but less read work than B9; batch the private hop next |
 
 ### B0 facts
 
@@ -161,6 +162,22 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   unlocked, while B6 remains the stronger condition-ingest frontier. The next
   isolated change routes registration back to the freed s3 App; after that,
   balance or batch condition forwarding instead of accepting the 499 wall.
+
+### B10 decision: lower score, much healthier registration capacity
+
+- Moving only registration back to s3 raised HTTP 201 from 692 to 999 and
+  removed every registration 499/500/502. Condition 202 also rose 100,209 ->
+  110,927. This is a structural improvement despite the score falling.
+- Score fell 160,102 -> 147,446 because successful reads fell: trend 29,611 ->
+  27,722 and condition reads 23,270 -> 22,986. The benchmark shifted work
+  toward newly admitted registrations and their downstream condition traffic.
+- The synchronous condition edge remains overloaded: about 118k condition
+  499s and 125 condition 500/502s; s2 stayed about 67.5% busy and its App used
+  52.98 sampled CPU-seconds. B10 is the current total-work/correctness frontier,
+  while B9 remains the scalar score champion.
+- B11 keeps B10 routing and batches up to 64 compact updates behind eight
+  internal workers. It does not delay lightly loaded requests; it only merges
+  work already queued under pressure.
 
 ## Four current-system maps
 

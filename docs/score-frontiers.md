@@ -94,6 +94,16 @@
   a total-work frontier. Preserve B6 separately as the condition-ingest
   frontier and reduce edge synchronization/profiling cost in follow-ups.
 
+### B10: registration returned to s3 (`e8d6467`)
+
+- Score: 147,446, PASSED, deduction 0
+- Accepted work: registration 201 692 -> 999; condition 202 100,209 -> 110,927
+- Correctness: registration 499 779 -> 0 and registration 500/502 7 -> 0
+- Tradeoff: successful trend and condition reads fell, so score fell 7.9%
+  despite the healthier admission and larger accepted write workload
+- Decision: current total-work/correctness frontier. Keep B9 as score champion;
+  use B10 as the base for compact-hop batching and load balancing.
+
 ## Decision rule
 
 The score champion is always restorable and is the final-mode candidate. A
