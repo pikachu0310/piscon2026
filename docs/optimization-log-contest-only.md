@@ -37,6 +37,7 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 | B15 | 20:53 | `aa78bde` | Exact repeat of the 2:1 edge:direct split | Separate ratio behavior from B14's offered-load trajectory | portal `fe92aa0a-306f-4300-b958-cc61bea2c383`; artifact `20260720T115346.002992Z-s1-8fcb16` | **150,001**, PASSED, deduction 0 | Confirms a stable CPU-balance/low-failure frontier; use it as the isolation base for the metadata registry |
 | B16 | 21:00 | `0164d14` App + `aa78bde` Nginx | Build an initialize-time ISU metadata registry and publish registrations after commit | B13 slow log: 46.59k queries; 26,140 repeated ownership/name SELECTs used 3.85s | portal `bd59ce1c-e5ca-481a-94f4-248094d2b494`; artifact `20260720T120057.641902Z-s1-f0a807` | **155,390**, PASSED, deduction 0 | Proven unit-cost/read-path improvement on stable 2:1 base; combine with B13's 3:1 ratio next |
 | B17 | 21:07 | `0164d14` App + `d950610` Nginx | Combine the metadata registry with B13's 3:1 ingress ratio | B16 proves the registry saving; B13 is the score/peak-ingest ratio | portal `96b580d0-3bce-4d40-aaab-d1e9006b9741`; artifact `20260720T120724.815614Z-s1-843bcc` | **155,380**, PASSED, deduction 0 | Strong 3:1 low-DB/low-499 frontier, not score champion; exact repeat before choosing the ratio |
+| B18 | 21:11 | `0164d14` App + `d950610` Nginx | Exact repeat of registry plus 3:1 ingress | Determine whether B17 converts registry savings as reliably as the 2:1 reference | portal `0c194caf-83bf-451e-bd6d-938857808d76`; artifact `20260720T121118.177737Z-s1-697e02` | **144,949**, PASSED, deduction 0 | Similar accepted load to B16 at higher CPU and fewer reads; select 2:1 as the stable isolation base while preserving B13 rollback |
 
 ### B0 facts
 
@@ -311,6 +312,19 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   did not reintroduce failures or DB cost.
 - Retain B17 as a 3:1 low-DB/low-overload capacity frontier. B18 repeats it
   exactly before selecting the downstream base.
+
+### B18 decision: 2:1 is the better stable base after indexing
+
+- B18 completed 246,600 condition writes, 956 registrations, 26,387 trend
+  reads and 22,326 condition reads with 308 condition 499s. These condition,
+  registration and trend counts closely match B16's 2:1 workload.
+- Under that comparable load, total App CPU was 58.95 seconds versus B16's
+  54.67 (+7.8%), and condition reads were 1,060 lower. Score was 144,949 versus
+  155,390. B17's higher condition arrival was not reproduced.
+- The result is useful even though it does not raise score: it controls for
+  offered work and shows that 3:1 consumes more edge CPU without consistently
+  turning it into downstream reads. Restore 2:1 for the next isolated code
+  family. Keep the exact B13 3:1 backup as the scalar-score rollback target.
 
 ## Four current-system maps
 

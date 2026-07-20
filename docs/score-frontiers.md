@@ -196,6 +196,16 @@ work to move saturation downstream.
 - Decision: retain as the 3:1 low-DB/low-failure frontier. Repeat once before
   choosing between the stable 2:1 and peak-ingest 3:1 bases.
 
+### B18: exact registry plus 3:1 repeat (`0164d14` + `d950610`)
+
+- Score: 144,949, PASSED, deduction 0
+- Accepted work: 246,600 condition 202, 956 registration 201, 26,387 trend 200
+  and 22,326 condition-read 200
+- Comparable-load result: versus B16's 2:1 run, total App CPU +7.8% and
+  condition reads -1,060 with nearly identical condition/registration/trend
+- Decision: 2:1 becomes the stable base for the next code family. Preserve B13
+  as exact score rollback and B17 as the higher-arrival 3:1 registry point.
+
 ## Decision rule
 
 Every run is judged on five axes:
