@@ -901,3 +901,9 @@ slow/access/pprof/fgprof/OS計測だけを根拠に次の改善を選ぶ。
 - conditionは246,974件中202が241,164件、4xxが5,810件、平均13ms、p95 69ms。B49の202 247,192件、4xx 9,098件、p95 84msよりtail/errorは改善したが、登録成功は866件、1登録あたり202は約278.5件で、run全体の負荷生成量とscoreは大きく低下した。
 - slow logは35,870 query・5秒でread SQLが戻ったが、DBは平均83.9% idle、Appも59.9% idleで飽和していない。read SQL/cacheの有無より、100ms timeoutのcondition bodyをNginxが全量待つことが得点機会を制限したと判断する。
 - POST ISUの500 4件は、s3 journalで同時刻に4件のMariaDB error 1213 deadlockとして確認した。これはbufferingとは別の既存問題として分離する。E53を棄却し、メタデータcacheなしを維持したままconditionだけ`proxy_request_buffering off`へ戻す。
+
+### E54 expectation
+
+- E53直後の`SHOW ENGINE INNODB STATUS`では、同じ`jia_isu_uuid`を登録する2 transactionがdeadlockしていた。先行requestはUNIQUE indexのX lockを保持してJIA応答後のUPDATEを待ち、1秒timeout後に再送されたrequestが同じUUIDをINSERTしてS lockを待つことで循環した。MariaDBは再送側をvictimにしてerror 1213を返し、公式benchではPOST ISUの500として4点減点された。
+- 公式bench sourceではload中のPOST ISUを成功するまで再送し、409は「先行登録が完了した」として正常終了する。そこでUUID単位のmutexをtransaction開始前に取り、同じUUIDの登録だけを直列化する。先行requestがcommitした後の再送は既存のUNIQUE判定で409となる。異なるUUID、JIA、DB transaction、画像、response JSONは変えない。
+- prepareの未認証・登録済み・他user重複・存在しないUUIDを維持し、公式valid、POST ISUの500/deadlock、201/409、登録成功、p95、scoreを確認する。deadlockが残る、異なるUUIDまで待たせる、prepare不一致、またはscore/登録量が悪化すればmutexを外す。

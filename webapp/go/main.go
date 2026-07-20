@@ -76,6 +76,8 @@ var (
 		loaded bool
 	}{uuids: make(map[string]struct{})}
 
+	isuRegistrationLocks sync.Map
+
 	conditionHistoryCache = struct {
 		sync.RWMutex
 		histories map[string]*ConditionHistory
@@ -865,6 +867,11 @@ func postIsu(c echo.Context) error {
 			return c.NoContent(http.StatusInternalServerError)
 		}
 	}
+
+	registrationLockValue, _ := isuRegistrationLocks.LoadOrStore(jiaIsuUUID, &sync.Mutex{})
+	registrationLock := registrationLockValue.(*sync.Mutex)
+	registrationLock.Lock()
+	defer registrationLock.Unlock()
 
 	tx, err := db.Beginx()
 	if err != nil {
