@@ -185,6 +185,17 @@ work to move saturation downstream.
 - Decision: promote as a proven read/unit-cost frontier and test it with B13's
   score-champion 3:1 ingress ratio.
 
+### B17: metadata registry with 3:1 ingress (`0164d14` + `d950610`)
+
+- Score: 155,380, PASSED, deduction 0
+- Accepted work: 262,184 condition 202, 910 registration 201, 25,385 trend 200
+  and 23,645 condition-read 200; only 114 condition 499
+- Database: 7.29k calls and 2s execution, preserving B16's 84% query reduction
+- Unit cost versus old-code B13: total App CPU -8.1%; CPU per accepted condition
+  about -1.8%
+- Decision: retain as the 3:1 low-DB/low-failure frontier. Repeat once before
+  choosing between the stable 2:1 and peak-ingest 3:1 bases.
+
 ## Decision rule
 
 Every run is judged on five axes:

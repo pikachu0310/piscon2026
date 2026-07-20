@@ -36,6 +36,7 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 | B14 | 20:49 | `aa78bde` | Change condition ingress from 3:1 to 2:1 edge:direct | B13 App CPU samples were 36.31s on s2 and 29.26s on s3 | portal `fd30ddd0-6e24-4eb7-8187-44779e45b15c`; artifact `20260720T114923.209743Z-s1-f2e80d` | **144,824**, PASSED, deduction 0 | CPU-balance and low-overload frontier, not an automatic regression; offered condition load was 11.6% lower, so repeat exactly |
 | B15 | 20:53 | `aa78bde` | Exact repeat of the 2:1 edge:direct split | Separate ratio behavior from B14's offered-load trajectory | portal `fe92aa0a-306f-4300-b958-cc61bea2c383`; artifact `20260720T115346.002992Z-s1-8fcb16` | **150,001**, PASSED, deduction 0 | Confirms a stable CPU-balance/low-failure frontier; use it as the isolation base for the metadata registry |
 | B16 | 21:00 | `0164d14` App + `aa78bde` Nginx | Build an initialize-time ISU metadata registry and publish registrations after commit | B13 slow log: 46.59k queries; 26,140 repeated ownership/name SELECTs used 3.85s | portal `bd59ce1c-e5ca-481a-94f4-248094d2b494`; artifact `20260720T120057.641902Z-s1-f0a807` | **155,390**, PASSED, deduction 0 | Proven unit-cost/read-path improvement on stable 2:1 base; combine with B13's 3:1 ratio next |
+| B17 | 21:07 | `0164d14` App + `d950610` Nginx | Combine the metadata registry with B13's 3:1 ingress ratio | B16 proves the registry saving; B13 is the score/peak-ingest ratio | portal `96b580d0-3bce-4d40-aaab-d1e9006b9741`; artifact `20260720T120724.815614Z-s1-843bcc` | **155,380**, PASSED, deduction 0 | Strong 3:1 low-DB/low-499 frontier, not score champion; exact repeat before choosing the ratio |
 
 ### B0 facts
 
@@ -294,6 +295,22 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   condition 499 was only 111. This is a real unit-cost/read-capacity improvement,
   not a score-only workload shift.
 - B17 restores B13's 3:1 score/peak-ingest ratio while keeping the registry.
+
+### B17 decision: registry savings persisted, score conversion varied
+
+- The active 3:1 split was exact: 199,854 condition attempts through s2 and
+  66,619 directly to s3. It completed 262,184 condition writes with only 114
+  499s, plus 910 registrations, 25,385 trend reads and 23,645 condition reads.
+- The registry effect persisted: 7.29k DB calls and 2s measured execution,
+  essentially identical to B16. Versus the old-code B13 3:1 run, total App CPU
+  fell 65.57 -> 60.28 seconds (-8.1%) and CPU per accepted condition improved
+  about 1.8%.
+- Score remained 155,380 rather than B13's 162,980 because the work mix differed:
+  accepted condition work was 6.4% lower, condition reads 10.7% lower and the
+  benchmark admitted a different registration/trend trajectory. The code change
+  did not reintroduce failures or DB cost.
+- Retain B17 as a 3:1 low-DB/low-overload capacity frontier. B18 repeats it
+  exactly before selecting the downstream base.
 
 ## Four current-system maps
 
