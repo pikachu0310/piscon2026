@@ -65,6 +65,20 @@
 - Decision: compact state is now converted into official score. This exact
   App/config combination is the rollback target for topology experiments.
 
+### B7/B8: registration-only App on s2 (`bb0d619`)
+
+- Scores: 134,195 and 136,587; B7 PASSED, B8 portal status refresh pending
+- B8 accepted work: registration 201 rose 896 -> 901, while condition 202 fell
+  246,225 -> 244,519 and condition 499 fell 544 -> 99
+- Resource shift: s2 App used 3.25 CPU-seconds but accumulated 198.24 seconds
+  of JIA HTTP wait; s3 average busy CPU fell 43.1% -> 40.5%
+- Correctness machinery: exact method routing, shared-DB positive UUID
+  read-through, no negative cache, registration-only cache suppression, and an
+  initialize gate that drains remote registrations before DB reset
+- Decision: retain as an isolation/capacity branch. It has not yet proven more
+  total accepted work or a higher score. Try to convert the spare-node topology
+  by offloading condition ingress/decode while keeping B6 fully restorable.
+
 ## Decision rule
 
 The score champion is always restorable and is the final-mode candidate. A

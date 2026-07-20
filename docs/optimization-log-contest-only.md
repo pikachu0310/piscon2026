@@ -26,6 +26,8 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 | B4 | 18:59 | `da4fd9a` | Exact repeat of B3 | Separate benchmark variance from static-compression mechanism | portal `926d9431-620d-4454-853d-4096d56eedba`; artifact `20260720T095959.518837Z-s1-a49d6d` | 128,296, PASSED, deduction 0 | Capacity frontier confirmed; not score champion |
 | B5 | 19:20 | `f254b4c` | Compact generation-scoped condition state on the B3/B4 precompressed ingress | Heap proved 74% of retained memory was history; shrink each entry from 48 to 16 bytes and remove pointer scanning | portal `1d79911c-53b2-4613-8316-88e2b990697b`; artifact `20260720T102008.890588Z-s1-4fc66b` | **134,561**, PASSED, deduction 0 | New score champion and strong capacity frontier |
 | B6 | 19:27 | `6ee2209` | Keep compact state but restore B0 uncompressed client delivery | B5 freed App capacity but precompression reduced registration arrivals; feed the frontier with B0 ingress behavior | portal `43a8ea3f-ffec-4e5e-bc1e-bb547653308b`; artifact `20260720T102755.490389Z-s1-57d2f2` | **142,430**, PASSED, deduction 0 | New score champion; compact state converts to score when demand is restored |
+| B7 | 19:47 | `bb0d619` | Route only registration POSTs to a registration-only App colocated with MariaDB on s2 | Registration spends almost all wall time waiting for JIA while s2 is about 83% idle; isolate that wait from condition ownership on s3 | portal `58cf5dbc-634a-447e-bf6d-d3bb1829b98a`; artifact `20260720T104747.088972Z-s1-fd5739` | 134,195, PASSED, deduction 0 | Correct topology, not a work frontier on this run; repeat with both App profiles enabled |
+| B8 | 19:53 | `bb0d619` | Exact B7 repeat after enabling s2 CPU pprof and fgprof capture | Distinguish benchmark/JIA variance and measure the actual registration-only process | portal `14708ae4-ef0c-40c5-b62d-2bead6c3cf86`; artifact `20260720T105336.406228Z-s1-53128e` | 136,587, final result pending portal status refresh, deduction 0 in live log | Registration 201 exceeds B6, but condition 202 falls; retain as an isolation frontier, not score champion |
 
 ### B0 facts
 
@@ -119,14 +121,33 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   wait and image body retention to idle s2 while keeping condition ownership on
   s3, with DB fallback on a known-UUID cache miss.
 
+### B7/B8 decision: registration isolation is real but not yet converted
+
+- Method routing is exact: `POST /api/isu` reaches s2, while `GET /api/isu`,
+  initialize, condition reads/writes and trend remain on s3. A shared-DB
+  positive read-through prevents newly registered UUIDs from remaining 404.
+- B8 completed 901 registrations versus B6's 896. The registration-only App
+  used only 3.25 CPU-seconds, while fgprof attributed 198.24 goroutine-seconds
+  to its JIA HTTP call. The isolated work is overwhelmingly waiting, not CPU.
+- B8 condition 202 fell 246,225 -> 244,519 and score fell 142,430 -> 136,587.
+  This is not labeled an automatic regression: one more piece of accepted work
+  can shift pressure downstream. Here the registration increase is only five,
+  however, and total accepted condition work also fell, so the run does not
+  establish a larger total-work frontier by itself.
+- Condition 499 remained low (99 versus B6's 544), and s3 busy CPU fell from
+  43.1% to 40.5%. The topology therefore remains useful isolation machinery.
+  The next conversion attempt moves condition body/decode work to the same
+  spare process while preserving the authoritative compact state on s3.
+
 ## Four current-system maps
 
 ### Traffic
 
-`benchmark -> s1 Nginx/TLS -> s3 Go App -> s2 MariaDB`. Static pages and
-assets terminate on s1. Every API request goes to the single s3 App. Condition
-uploads use `proxy_request_buffering off`, so slow client bodies occupy both
-the s1 proxy stream and an s3 Go HTTP connection.
+The live experiment is `benchmark -> s1 Nginx/TLS`, with `POST /api/isu`
+routed to a registration-only App on s2 and every other API routed to the
+authoritative App on s3. Both use MariaDB on s2. Static pages and assets
+terminate on s1. Condition uploads still use `proxy_request_buffering off`, so
+slow client bodies occupy both the s1 proxy stream and an s3 Go HTTP connection.
 
 ### State ownership
 
@@ -160,9 +181,10 @@ the s1 proxy stream and an s3 Go HTTP connection.
 
 ## Current hypothesis queue
 
-1. **Buffer small condition bodies at Nginx.** With request buffering on, s1
-   absorbs slow uploads and forwards a complete in-memory body to Go. Test for
-   lower Go goroutine wall time, HTTP syscall/GC cost and fewer late 400/499.
+1. **Decode condition bodies on the spare s2 App.** Route only condition POST
+   to s2, validate there, and forward a compact private representation to s3.
+   Keep all reads and the authoritative generation state on s3. Compare total
+   202 work, 499, per-node CPU, and s3 HTTP/decode cost before batching.
 2. **Build an initialize-time `IsuRegistry`.** Replace owner/name/list/id/
    character metadata SQL with immutable memory indexes, publishing a new ISU
    only after JIA success and DB commit.
@@ -176,10 +198,11 @@ the s1 proxy stream and an s3 Go HTTP connection.
    UUID to App workers on spare nodes and aggregate only global latest/metadata
    summaries. Do not use random load balancing.
 
-The first structural test is hypothesis 1 because B0 directly measured 2,731
-goroutine-seconds waiting in body reads and growing late-run partial/cancelled
-uploads. Hypotheses 2 and 3 remain capacity-frontier work even if their first
-official score is flat or lower.
+The next structural test is hypothesis 1. B7/B8 proved s2 can host an App with
+about 81% CPU idle, while s3 still spends roughly 2,700 goroutine-seconds in
+condition body reads and 5-6 CPU-seconds in the condition handler. Hypotheses 2
+and 3 remain capacity-frontier work even if their first official score is flat
+or lower.
 
 ## Hourly checkpoints
 
