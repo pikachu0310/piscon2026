@@ -26,6 +26,15 @@
 - Decision: mechanism retained as a branch commit, but not used alone. Restore
   B0 streaming and revisit only with a downstream admission/worker design.
 
+### B2: runtime static compression (`367dd65`)
+
+- Score: 127,939, PASSED, deduction 0
+- Demand signal: offered condition attempts increased to 263,690
+- Resource shift: vendor body fell 72%, while s1 Nginx CPU became the new
+  bottleneck and condition 499 rose to 31,870
+- Decision: preserve compression as a capacity mechanism, replace runtime
+  compression with prebuilt `.gz` files in B3
+
 ## Decision rule
 
 The score champion is always restorable and is the final-mode candidate. A

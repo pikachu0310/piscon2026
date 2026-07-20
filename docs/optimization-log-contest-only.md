@@ -21,6 +21,7 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
 |---|---|---|---|---|---|---|---|
 | B0 | 18:27 | `e70329f` | Unmodified starting checkout and live deployment | Fresh measure capture: access, slow log, CPU pprof, fgprof, pidstat and sar | portal `8c9bab42-1521-421b-8be1-23e77a008fea`; artifact `20260720T092734.057516Z-s1-a948bf` | **134,310**, PASSED, deduction 0 | Initial score champion |
 | B1 | 18:42 | `891c84e` | Buffer complete condition request bodies at s1 before proxying to Go | Compare ingress status, handler wall, CPU, valid work and read latency with B0 | portal `c92807fa-0864-414d-8562-a3506f433a4b`; artifact `20260720T094228.582644Z-s1-af6c1c` | 131,466, PASSED, deduction 0 | Capacity result but not champion; keep commit, restore streaming for next isolated test |
+| B2 | 18:50 | `367dd65` | Runtime-gzip the large client bundle on s1 | B0 transferred 979 MiB of vendor JS; compressed body is 211 KiB instead of 743 KiB | portal `78ca02d5-1e8d-456b-ac82-7d8e8a9240e1`; artifact `20260720T095009.878600Z-s1-4a0475` | 127,939, PASSED, deduction 0 | Mechanism valid, implementation rejected: runtime compression saturated ingress CPU |
 
 ### B0 facts
 
@@ -60,6 +61,17 @@ from older repositories, pre-goal Git history, or `docs/optimization-log.md`.
   accepted condition work: buffering makes slow uploaders hit their client
   deadline before proxying. It is recorded as a capacity result, not selected
   as score champion. Streaming is restored before testing static compression.
+
+### B2 decision: bandwidth fell, but runtime gzip moved the bottleneck to s1
+
+- Vendor responses shrank from about 743 KiB to 211 KiB, proving clients use
+  gzip. However s1 CPU became 63.8% busy across two CPUs and both Nginx workers
+  commonly consumed 40-90% of a CPU each.
+- Condition offered attempts rose to 263,690, but 31,870 ended as 499. Valid
+  condition 202 fell to 227,942, registration success fell to 781, and every
+  proxied endpoint developed a large latency tail.
+- The bandwidth mechanism is retained, but compression must move outside the
+  benchmark. B3 precompresses immutable assets once and uses `gzip_static`.
 
 ## Four current-system maps
 
