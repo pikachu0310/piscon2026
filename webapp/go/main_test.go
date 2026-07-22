@@ -88,6 +88,39 @@ func TestTrendSnapshotRefreshesOnlyDuringRamp(t *testing.T) {
 	}
 }
 
+func TestServeImmutableIsuIcon(t *testing.T) {
+	const uuid = "7f943f69-13d0-4b55-8912-730d1bf6a24d"
+	image := []byte("immutable image")
+	e := echo.New()
+
+	first := httptest.NewRecorder()
+	firstContext := e.NewContext(httptest.NewRequest(http.MethodGet, "/api/isu/"+uuid+"/icon", nil), first)
+	if err := serveImmutableIsuIcon(firstContext, uuid, image); err != nil {
+		t.Fatal(err)
+	}
+	if first.Code != http.StatusOK || !bytes.Equal(first.Body.Bytes(), image) {
+		t.Fatalf("first response = (%d, %q), want (%d, %q)", first.Code, first.Body.Bytes(), http.StatusOK, image)
+	}
+	if got := first.Header().Get("Cache-Control"); got != "private, max-age=3600" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	etag := first.Header().Get("ETag")
+	if etag != `"`+uuid+`"` {
+		t.Fatalf("ETag = %q", etag)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/isu/"+uuid+"/icon", nil)
+	request.Header.Set("If-None-Match", etag)
+	revalidated := httptest.NewRecorder()
+	revalidatedContext := e.NewContext(request, revalidated)
+	if err := serveImmutableIsuIcon(revalidatedContext, uuid, image); err != nil {
+		t.Fatal(err)
+	}
+	if revalidated.Code != http.StatusNotModified || revalidated.Body.Len() != 0 {
+		t.Fatalf("revalidated response = (%d, %q), want empty 304", revalidated.Code, revalidated.Body.Bytes())
+	}
+}
+
 func TestCachedConditionLayoutAndFlags(t *testing.T) {
 	if size := unsafe.Sizeof(CachedCondition{}); size != 16 {
 		t.Fatalf("CachedCondition size = %d, want 16", size)

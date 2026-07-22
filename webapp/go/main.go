@@ -2163,7 +2163,7 @@ func getIsuIcon(c echo.Context) error {
 	image, ok := iconCache.images[cacheKey]
 	iconCache.RUnlock()
 	if ok {
-		return c.Blob(http.StatusOK, "", image)
+		return serveImmutableIsuIcon(c, jiaIsuUUID, image)
 	}
 
 	err = db.Get(&image, "SELECT `image` FROM `isu` WHERE `jia_user_id` = ? AND `jia_isu_uuid` = ?",
@@ -2178,6 +2178,16 @@ func getIsuIcon(c echo.Context) error {
 	}
 
 	cacheIsuIcon(jiaUserID, jiaIsuUUID, image)
+	return serveImmutableIsuIcon(c, jiaIsuUUID, image)
+}
+
+func serveImmutableIsuIcon(c echo.Context, jiaIsuUUID string, image []byte) error {
+	etag := `"` + jiaIsuUUID + `"`
+	c.Response().Header().Set("Cache-Control", "private, max-age=3600")
+	c.Response().Header().Set("ETag", etag)
+	if c.Request().Header.Get("If-None-Match") == etag {
+		return c.NoContent(http.StatusNotModified)
+	}
 	return c.Blob(http.StatusOK, "", image)
 }
 
