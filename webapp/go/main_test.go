@@ -88,6 +88,46 @@ func TestTrendSnapshotRefreshesOnlyDuringRamp(t *testing.T) {
 	}
 }
 
+func TestCompletedConditionRangeRequiresSafetyHorizon(t *testing.T) {
+	state := newConditionState()
+	uuid := "f4880cf8-67ec-4f4c-914d-72673eac94a2"
+	endTime := time.Unix(1_700_000_000, 0).Unix()
+	history := getOrCreateConditionHistory(state, uuid)
+	history.conditions = []CachedCondition{{Timestamp: endTime + int64(completedRangeSafetyHorizon/time.Second) - 1}}
+
+	if completedConditionRange(state, uuid, endTime) {
+		t.Fatal("range must not be cached before the safety horizon")
+	}
+	history.conditions[0].Timestamp++
+	if !completedConditionRange(state, uuid, endTime) {
+		t.Fatal("range should be cacheable once the safety horizon has elapsed")
+	}
+	if completedConditionRange(state, "missing", endTime) {
+		t.Fatal("missing ISU must not be cacheable")
+	}
+}
+
+func TestTrendBecomesPrivateCacheableAfterRamp(t *testing.T) {
+	state := newConditionState()
+	state.trendBody = []byte(`[]`)
+	atomic.StoreInt64(&state.trendRampStartedAt, time.Now().Add(-trendRampDuration).UnixNano())
+	previous := currentConditionState()
+	conditionState.Store(state)
+	if previous != nil {
+		t.Cleanup(func() { conditionState.Store(previous) })
+	}
+
+	e := echo.New()
+	recorder := httptest.NewRecorder()
+	context := e.NewContext(httptest.NewRequest(http.MethodGet, "/api/trend", nil), recorder)
+	if err := getTrend(context); err != nil {
+		t.Fatal(err)
+	}
+	if got := recorder.Header().Get("Cache-Control"); got != privateResponseCacheControl {
+		t.Fatalf("Cache-Control = %q, want %q", got, privateResponseCacheControl)
+	}
+}
+
 func TestServeImmutableIsuIcon(t *testing.T) {
 	const uuid = "7f943f69-13d0-4b55-8912-730d1bf6a24d"
 	image := []byte("immutable image")
@@ -101,7 +141,7 @@ func TestServeImmutableIsuIcon(t *testing.T) {
 	if first.Code != http.StatusOK || !bytes.Equal(first.Body.Bytes(), image) {
 		t.Fatalf("first response = (%d, %q), want (%d, %q)", first.Code, first.Body.Bytes(), http.StatusOK, image)
 	}
-	if got := first.Header().Get("Cache-Control"); got != "private, max-age=3600" {
+	if got := first.Header().Get("Cache-Control"); got != privateResponseCacheControl {
 		t.Fatalf("Cache-Control = %q", got)
 	}
 	etag := first.Header().Get("ETag")

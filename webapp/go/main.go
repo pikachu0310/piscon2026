@@ -46,6 +46,8 @@ const (
 	scoreConditionLevelCritical = 1
 	trendRampRefreshInterval    = 500 * time.Millisecond
 	trendRampDuration           = 4500 * time.Millisecond
+	completedRangeSafetyHorizon = 24 * time.Hour
+	privateResponseCacheControl = "private, max-age=3600"
 	conditionFlagSitting        = uint8(1 << 3)
 	conditionRequestBufferSize  = 2048
 	conditionForwardBatchLimit  = 64
@@ -605,6 +607,18 @@ func trendSnapshotFresh(state *ConditionState, now time.Time) bool {
 		return true
 	}
 	return now.Before(state.trendExpiresAt)
+}
+
+func setPrivateResponseCache(c echo.Context) {
+	c.Response().Header().Set("Cache-Control", privateResponseCacheControl)
+}
+
+func completedConditionRange(state *ConditionState, jiaIsuUUID string, endTime int64) bool {
+	latest, ok := latestCachedCondition(state, jiaIsuUUID)
+	if !ok {
+		return false
+	}
+	return latest.Timestamp >= endTime+int64(completedRangeSafetyHorizon/time.Second)
 }
 
 func clearSessionCache() {
@@ -2141,6 +2155,7 @@ func getIsuID(c echo.Context) error {
 		return c.String(http.StatusNotFound, "not found: isu")
 	}
 
+	setPrivateResponseCache(c)
 	return c.JSON(http.StatusOK, res)
 }
 
@@ -2183,7 +2198,7 @@ func getIsuIcon(c echo.Context) error {
 
 func serveImmutableIsuIcon(c echo.Context, jiaIsuUUID string, image []byte) error {
 	etag := `"` + jiaIsuUUID + `"`
-	c.Response().Header().Set("Cache-Control", "private, max-age=3600")
+	setPrivateResponseCache(c)
 	c.Response().Header().Set("ETag", etag)
 	if c.Request().Header.Get("If-None-Match") == etag {
 		return c.NoContent(http.StatusNotModified)
@@ -2230,6 +2245,9 @@ func getIsuGraph(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
+	if completedConditionRange(currentConditionState(), jiaIsuUUID, date.Add(24*time.Hour).Unix()) {
+		setPrivateResponseCache(c)
+	}
 	return c.JSON(http.StatusOK, res)
 }
 
@@ -2720,7 +2738,11 @@ func getTrend(c echo.Context) error {
 	state.trendMu.Lock()
 	if trendSnapshotFresh(state, now) {
 		body := state.trendBody
+		cacheable := atomic.LoadInt64(&state.trendRampStartedAt) != 0 && !trendRampActive(state, now)
 		state.trendMu.Unlock()
+		if cacheable {
+			setPrivateResponseCache(c)
+		}
 		return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, body)
 	}
 
@@ -2742,7 +2764,11 @@ func getTrend(c echo.Context) error {
 	} else {
 		state.trendExpiresAt = time.Time{}
 	}
+	cacheable := atomic.LoadInt64(&state.trendRampStartedAt) != 0 && !trendRampActive(state, now)
 	state.trendMu.Unlock()
+	if cacheable {
+		setPrivateResponseCache(c)
+	}
 
 	return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, body)
 }
