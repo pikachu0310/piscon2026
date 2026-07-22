@@ -100,9 +100,40 @@ Portal内訳:
 
 判定: serverを増やす前に、公式validatorの1秒condition反映猶予に合わせてactive graphを1秒だけclient cacheする。また、completed graphのmarshal済みbodyをinitialize世代内で共有し、signout後の再取得でも再計算しない。2 user追加はGraphGood比率を落としたため完全凍結へ戻す。この3点をR4の一つのbundleとする。
 
-## R4: active graph 1秒cache + completed graph encoded cache + 完全凍結（実装中）
+## R4: active graph 1秒cache + completed graph encoded cache + 完全凍結
 
 - active/today graph: `Cache-Control: private, max-age=1`
 - completed graph: 従来の長期client cacheに加え、認可後にmarshal済みJSONをgeneration-scoped memoryから返す
 - trend: refresh windowを0秒にし、追加userを再び0人にする
 - 安全根拠: 公式benchmarkの`ConditionDelayTime`は1秒。fresh cacheが返り得る時間をその猶予より長くしない
+- source: `8dc37724d32521bc16eef3799f5725fcbaaff54c`
+- binary (s2/s3): `9f169b88712a876496f39097e41f03b4164395fe08f63834f48e917f5c1e4121`
+- Portal benchmark: `417c71ac-4739-4788-ba23-c9d934252269`
+- score: **6,379,010 / PASSED / deduction 0 / timeout 0**
+- capture: `/home/pikachu0310/github/isucon-agent-kit/runs/20260722T062148.370372Z-s1-2ef6c1`
+
+Portal内訳:
+
+| tag | count |
+|---|---:|
+| GraphGood | 36,111 |
+| GraphNormal | 2,875 |
+| GraphBad | 0 |
+| GraphWorst | 5,460 |
+| TodayGraphGood | 5,225 |
+| TodayGraphNormal | 830 |
+| TodayGraphBad | 0 |
+| TodayGraphWorst | 529 |
+| ReadInfoCondition | 13,127 |
+| ReadWarningCondition | 988 |
+| ReadCriticalCondition | 0 |
+
+実測:
+
+- scoreはR3から **+871,842（+15.83%）**。650万点まで残り121,426点
+- graphは45,618 network request（うち2xx 45,118）に対し、Portalでは44,446 completed graphと6,584 today graphを採点
+- condition POST 70,340、condition GET 50,352。全tickでuser追加0人
+- s1/s3 CPU idleはそれぞれ約69%、s2は約81%。s1送信は平均77,449KB/sで、CPU・帯域とも未飽和
+- s3 CPU profileで`generateIsuGraphResponse`はR3の3.66秒から0.73秒へ低下
+
+判定: active graphを公式validatorの猶予内だけ再利用する変更が主因となり、大幅にscoring loopを高速化した。次は現バイナリをchampionとして退避し、残り約2%を再測定の分散または同じ安全性を保てる構造改善で詰める。
