@@ -8,7 +8,7 @@
 - score: **167,395 / PASSED / deduction 0 / timeout 397**
 - capture: `/home/pikachu0310/github/isucon-agent-kit/runs/20260722T021859.404731Z-s1-b7f8c5`
 - live source: `a7955d62c9eaa94c0560b6d98518c93d08ef4c61`
-- topology: s1=Nginx、s2=registration+condition forward+MariaDB、s3=全conditionの正本+全read
+- topology: s1=Nginx、s2=condition edge/forward+MariaDB、s3=registration+全conditionの正本+全read
 - 主な観測値: condition POST 271,597、登録POST 1,023、graph GET 3,043、condition GET 24,816
 
 判定: POSTを28万件受けても、約900台へ薄く配るため24時間内の各hourに必要なcondition密度を作れず、GraphWorstが支配的だった。condition POSTや登録自体には直接得点がなく、`trendの変化 -> user追加 -> ISU追加` を無制御に回したことが、得点になるread/graphを圧迫していた。
@@ -130,10 +130,23 @@ Portal内訳:
 
 実測:
 
-- scoreはR3から **+871,842（+15.83%）**。650万点まで残り121,426点
+- scoreはR3から **+871,842（+15.83%）**。650万点まで残り120,990点（650万点を超えるには120,991点）
 - graphは45,618 network request（うち2xx 45,118）に対し、Portalでは44,446 completed graphと6,584 today graphを採点
 - condition POST 70,340、condition GET 50,352。全tickでuser追加0人
 - s1/s3 CPU idleはそれぞれ約69%、s2は約81%。s1送信は平均77,449KB/sで、CPU・帯域とも未飽和
 - s3 CPU profileで`generateIsuGraphResponse`はR3の3.66秒から0.73秒へ低下
 
 判定: active graphを公式validatorの猶予内だけ再利用する変更が主因となり、大幅にscoring loopを高速化した。次は現バイナリをchampionとして退避し、残り約2%を再測定の分散または同じ安全性を保てる構造改善で詰める。
+
+得点式から見る最短の突破条件は、完成済みの`GraphGood`を807回増やすこと（`807 * 150 = 121,050`、合計6,500,060点）である。実行ごとの分散を考えると、目標は1,000〜1,500回増に置く。
+
+## 2026-07-22 finalization
+
+- 21:00 JSTに探索を凍結し、`isucon-agent-kit/bin/isuctl final`を実行した。
+- 全3台をfinal modeへ切り替えて再起動した後、21:01 JSTのrole-aware doctorは全項目成功した。
+- s1のNginx、s2のMariaDB、s2/s3のAppがactiveで、全台のtrigger watcherは停止していた。
+- live AppはR4と同じsource `8dc37724d32521bc16eef3799f5725fcbaaff54c`、s2/s3 binary `9f169b88712a876496f39097e41f03b4164395fe08f63834f48e917f5c1e4121`である。
+- branch HEAD `773beeb7fb99815a945370144c4ae29d9ce55525`はSPA shellのNginx client cacheを追加するが、R4時点では未公式計測だった。App API用locationはcache対象外である。
+- 再起動後の公式final benchmark結果は、Portal操作を行った後に追記する。
+
+最終構成の再現情報は[`final-manifest-20260722.md`](final-manifest-20260722.md)を正本とする。過去の`score-frontiers.md`にあるB13と、`optimization-log.md`にあるE54は履歴として残すが、現在のrollback先ではない。
