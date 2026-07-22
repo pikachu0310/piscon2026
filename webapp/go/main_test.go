@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 	"unsafe"
+
+	"github.com/labstack/echo/v4"
 )
 
 func TestConditionJSONMatchesStandardLibrary(t *testing.T) {
@@ -36,6 +39,30 @@ func TestConditionJSONMatchesStandardLibrary(t *testing.T) {
 		if standardErr == nil && !reflect.DeepEqual(standard, fast) {
 			t.Fatalf("decoded value differs for %q: standard=%#v fast=%#v", body, standard, fast)
 		}
+	}
+}
+
+func TestTrendSnapshotHasNoExpiry(t *testing.T) {
+	state := newConditionState()
+	want := []byte(`[{"character":"SittingIsPower"}]`)
+	state.trendBody = want
+	previous := currentConditionState()
+	conditionState.Store(state)
+	if previous != nil {
+		t.Cleanup(func() { conditionState.Store(previous) })
+	}
+
+	e := echo.New()
+	recorder := httptest.NewRecorder()
+	context := e.NewContext(httptest.NewRequest(http.MethodGet, "/api/trend", nil), recorder)
+	if err := getTrend(context); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if !bytes.Equal(recorder.Body.Bytes(), want) {
+		t.Fatalf("trend response = %q, want %q", recorder.Body.Bytes(), want)
 	}
 }
 

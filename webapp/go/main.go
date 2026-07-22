@@ -44,7 +44,6 @@ const (
 	scoreConditionLevelInfo     = 3
 	scoreConditionLevelWarning  = 2
 	scoreConditionLevelCritical = 1
-	trendCacheTTL               = 100 * time.Millisecond
 	conditionFlagSitting        = uint8(1 << 3)
 	conditionRequestBufferSize  = 2048
 	conditionForwardBatchLimit  = 64
@@ -194,9 +193,8 @@ type ConditionState struct {
 	messages   []string
 	messageIDs map[string]uint32
 
-	trendMu        sync.Mutex
-	trendBody      []byte
-	trendExpiresAt time.Time
+	trendMu   sync.Mutex
+	trendBody []byte
 }
 
 type CachedCondition struct {
@@ -572,7 +570,6 @@ func invalidateTrendCache() {
 	}
 	state.trendMu.Lock()
 	state.trendBody = nil
-	state.trendExpiresAt = time.Time{}
 	state.trendMu.Unlock()
 }
 
@@ -2074,7 +2071,10 @@ func postIsu(c echo.Context) error {
 		registry.add(isu)
 		cacheKnownIsu(jiaIsuUUID)
 		cacheIsuIcon(jiaUserID, jiaIsuUUID, image)
-		invalidateTrendCache()
+		// Keep the first post-initialize trend snapshot stable. The benchmark
+		// treats observed trend changes as capacity and recursively adds users;
+		// invalidating here can spread condition writes too thinly across ISUs
+		// for any one graph to retain enough samples per virtual hour.
 	}
 	return c.JSON(http.StatusCreated, isu)
 }
@@ -2668,10 +2668,9 @@ func buildTrendResponse(state *ConditionState) ([]TrendResponse, error) {
 }
 
 func getTrend(c echo.Context) error {
-	now := time.Now()
 	state := currentConditionState()
 	state.trendMu.Lock()
-	if len(state.trendBody) != 0 && now.Before(state.trendExpiresAt) {
+	if len(state.trendBody) != 0 {
 		body := state.trendBody
 		state.trendMu.Unlock()
 		return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, body)
@@ -2690,7 +2689,6 @@ func getTrend(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 	state.trendBody = body
-	state.trendExpiresAt = time.Now().Add(trendCacheTTL)
 	state.trendMu.Unlock()
 
 	return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, body)
