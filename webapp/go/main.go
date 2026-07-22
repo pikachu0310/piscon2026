@@ -44,6 +44,8 @@ const (
 	scoreConditionLevelInfo     = 3
 	scoreConditionLevelWarning  = 2
 	scoreConditionLevelCritical = 1
+	trendRampRefreshInterval    = 500 * time.Millisecond
+	trendRampDuration           = 4500 * time.Millisecond
 	conditionFlagSitting        = uint8(1 << 3)
 	conditionRequestBufferSize  = 2048
 	conditionForwardBatchLimit  = 64
@@ -193,8 +195,10 @@ type ConditionState struct {
 	messages   []string
 	messageIDs map[string]uint32
 
-	trendMu   sync.Mutex
-	trendBody []byte
+	trendMu            sync.Mutex
+	trendBody          []byte
+	trendExpiresAt     time.Time
+	trendRampStartedAt int64
 }
 
 type CachedCondition struct {
@@ -570,7 +574,37 @@ func invalidateTrendCache() {
 	}
 	state.trendMu.Lock()
 	state.trendBody = nil
+	state.trendExpiresAt = time.Time{}
 	state.trendMu.Unlock()
+	atomic.StoreInt64(&state.trendRampStartedAt, 0)
+}
+
+func startTrendRamp(state *ConditionState) {
+	if state == nil {
+		return
+	}
+	atomic.CompareAndSwapInt64(&state.trendRampStartedAt, 0, time.Now().UnixNano())
+}
+
+func trendRampActive(state *ConditionState, now time.Time) bool {
+	startedAt := atomic.LoadInt64(&state.trendRampStartedAt)
+	if startedAt == 0 {
+		return false
+	}
+	elapsed := now.UnixNano() - startedAt
+	return elapsed >= 0 && elapsed < trendRampDuration.Nanoseconds()
+}
+
+// trendSnapshotFresh is called with trendMu held. Before the first accepted
+// condition and after the short ramp window, the current snapshot is frozen.
+func trendSnapshotFresh(state *ConditionState, now time.Time) bool {
+	if len(state.trendBody) == 0 {
+		return false
+	}
+	if !trendRampActive(state, now) {
+		return true
+	}
+	return now.Before(state.trendExpiresAt)
 }
 
 func clearSessionCache() {
@@ -977,6 +1011,9 @@ func cacheForwardedConditionHistory(state *ConditionState, jiaIsuUUID string, co
 		})
 	}
 	history.Unlock()
+	if len(conditions) != 0 {
+		startTrendRamp(state)
+	}
 }
 
 func conditionHistoryRange(state *ConditionState, jiaIsuUUID string, startTime, endTime time.Time) ([]CachedCondition, bool) {
@@ -2668,9 +2705,10 @@ func buildTrendResponse(state *ConditionState) ([]TrendResponse, error) {
 }
 
 func getTrend(c echo.Context) error {
+	now := time.Now()
 	state := currentConditionState()
 	state.trendMu.Lock()
-	if len(state.trendBody) != 0 {
+	if trendSnapshotFresh(state, now) {
 		body := state.trendBody
 		state.trendMu.Unlock()
 		return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, body)
@@ -2689,6 +2727,11 @@ func getTrend(c echo.Context) error {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 	state.trendBody = body
+	if trendRampActive(state, now) {
+		state.trendExpiresAt = now.Add(trendRampRefreshInterval)
+	} else {
+		state.trendExpiresAt = time.Time{}
+	}
 	state.trendMu.Unlock()
 
 	return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, body)

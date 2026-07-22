@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -63,6 +64,27 @@ func TestTrendSnapshotHasNoExpiry(t *testing.T) {
 	}
 	if !bytes.Equal(recorder.Body.Bytes(), want) {
 		t.Fatalf("trend response = %q, want %q", recorder.Body.Bytes(), want)
+	}
+}
+
+func TestTrendSnapshotRefreshesOnlyDuringRamp(t *testing.T) {
+	state := newConditionState()
+	state.trendBody = []byte(`[]`)
+	now := time.Unix(100, 0)
+
+	if !trendSnapshotFresh(state, now) {
+		t.Fatal("snapshot before condition ramp must stay frozen")
+	}
+	atomic.StoreInt64(&state.trendRampStartedAt, now.UnixNano())
+	state.trendExpiresAt = now.Add(trendRampRefreshInterval)
+	if !trendSnapshotFresh(state, now.Add(trendRampRefreshInterval-time.Nanosecond)) {
+		t.Fatal("snapshot should be reused before the refresh interval")
+	}
+	if trendSnapshotFresh(state, now.Add(trendRampRefreshInterval)) {
+		t.Fatal("snapshot should refresh when the interval expires during ramp")
+	}
+	if !trendSnapshotFresh(state, now.Add(trendRampDuration)) {
+		t.Fatal("snapshot must freeze after the ramp window")
 	}
 }
 
