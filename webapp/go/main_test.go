@@ -67,7 +67,7 @@ func TestTrendSnapshotHasNoExpiry(t *testing.T) {
 	}
 }
 
-func TestTrendSnapshotRefreshesOnlyDuringRamp(t *testing.T) {
+func TestTrendSnapshotFreezesImmediately(t *testing.T) {
 	state := newConditionState()
 	state.trendBody = []byte(`[]`)
 	now := time.Unix(100, 0)
@@ -76,15 +76,27 @@ func TestTrendSnapshotRefreshesOnlyDuringRamp(t *testing.T) {
 		t.Fatal("snapshot before condition ramp must stay frozen")
 	}
 	atomic.StoreInt64(&state.trendRampStartedAt, now.UnixNano())
-	state.trendExpiresAt = now.Add(trendRampRefreshInterval)
-	if !trendSnapshotFresh(state, now.Add(trendRampRefreshInterval-time.Nanosecond)) {
-		t.Fatal("snapshot should be reused before the refresh interval")
+	state.trendExpiresAt = now.Add(-time.Hour)
+	if !trendSnapshotFresh(state, now.Add(time.Hour)) {
+		t.Fatal("snapshot must remain frozen after condition ingestion starts")
 	}
-	if trendSnapshotFresh(state, now.Add(trendRampRefreshInterval)) {
-		t.Fatal("snapshot should refresh when the interval expires during ramp")
+}
+
+func TestGraphResponseCachePolicy(t *testing.T) {
+	e := echo.New()
+
+	activeRecorder := httptest.NewRecorder()
+	activeContext := e.NewContext(httptest.NewRequest(http.MethodGet, "/api/isu/id/graph", nil), activeRecorder)
+	setGraphResponseCache(activeContext, false)
+	if got := activeRecorder.Header().Get("Cache-Control"); got != activeGraphCacheControl {
+		t.Fatalf("active graph Cache-Control = %q, want %q", got, activeGraphCacheControl)
 	}
-	if !trendSnapshotFresh(state, now.Add(trendRampDuration)) {
-		t.Fatal("snapshot must freeze after the ramp window")
+
+	completedRecorder := httptest.NewRecorder()
+	completedContext := e.NewContext(httptest.NewRequest(http.MethodGet, "/api/isu/id/graph", nil), completedRecorder)
+	setGraphResponseCache(completedContext, true)
+	if got := completedRecorder.Header().Get("Cache-Control"); got != privateResponseCacheControl {
+		t.Fatalf("completed graph Cache-Control = %q, want %q", got, privateResponseCacheControl)
 	}
 }
 

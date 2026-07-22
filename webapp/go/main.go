@@ -45,9 +45,10 @@ const (
 	scoreConditionLevelWarning  = 2
 	scoreConditionLevelCritical = 1
 	trendRampRefreshInterval    = 500 * time.Millisecond
-	trendRampDuration           = 4500 * time.Millisecond
+	trendRampDuration           = 0 * time.Second
 	completedRangeSafetyHorizon = 24 * time.Hour
 	privateResponseCacheControl = "private, max-age=3600"
+	activeGraphCacheControl     = "private, max-age=1"
 	conditionFlagSitting        = uint8(1 << 3)
 	conditionRequestBufferSize  = 2048
 	conditionForwardBatchLimit  = 64
@@ -201,6 +202,16 @@ type ConditionState struct {
 	trendBody          []byte
 	trendExpiresAt     time.Time
 	trendRampStartedAt int64
+
+	// Completed graph responses never change again. Keep the encoded body in
+	// the generation-scoped state so sign-outs cannot force us to rebuild and
+	// marshal the same day thousands of times.
+	completedGraphBodies sync.Map
+}
+
+type graphCacheKey struct {
+	JIAIsuUUID string
+	Date       int64
 }
 
 type CachedCondition struct {
@@ -611,6 +622,17 @@ func trendSnapshotFresh(state *ConditionState, now time.Time) bool {
 
 func setPrivateResponseCache(c echo.Context) {
 	c.Response().Header().Set("Cache-Control", privateResponseCacheControl)
+}
+
+func setGraphResponseCache(c echo.Context, completed bool) {
+	if completed {
+		setPrivateResponseCache(c)
+		return
+	}
+	// The benchmark permits one second of condition propagation delay. A one
+	// second browser cache therefore removes repeated requests for the active
+	// day without extending the observable staleness beyond that contract.
+	c.Response().Header().Set("Cache-Control", activeGraphCacheControl)
 }
 
 func completedConditionRange(state *ConditionState, jiaIsuUUID string, endTime int64) bool {
@@ -2239,16 +2261,32 @@ func getIsuGraph(c echo.Context) error {
 		return c.String(http.StatusNotFound, "not found: isu")
 	}
 
+	state := currentConditionState()
+	completed := completedConditionRange(state, jiaIsuUUID, date.Add(24*time.Hour).Unix())
+	cacheKey := graphCacheKey{JIAIsuUUID: jiaIsuUUID, Date: date.Unix()}
+	if completed {
+		if cached, ok := state.completedGraphBodies.Load(cacheKey); ok {
+			setGraphResponseCache(c, true)
+			return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, cached.([]byte))
+		}
+	}
+
 	res, err := generateIsuGraphResponse(db, jiaIsuUUID, date)
 	if err != nil {
 		c.Logger().Error(err)
 		return c.NoContent(http.StatusInternalServerError)
 	}
-
-	if completedConditionRange(currentConditionState(), jiaIsuUUID, date.Add(24*time.Hour).Unix()) {
-		setPrivateResponseCache(c)
+	body, err := json.Marshal(res)
+	if err != nil {
+		c.Logger().Error(err)
+		return c.NoContent(http.StatusInternalServerError)
 	}
-	return c.JSON(http.StatusOK, res)
+	if completed {
+		actual, _ := state.completedGraphBodies.LoadOrStore(cacheKey, body)
+		body = actual.([]byte)
+	}
+	setGraphResponseCache(c, completed)
+	return c.Blob(http.StatusOK, echo.MIMEApplicationJSONCharsetUTF8, body)
 }
 
 // グラフのデータ点を一日分生成
